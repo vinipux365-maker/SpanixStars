@@ -356,7 +356,7 @@ async def init_db():
 
         # Каталоги VK и TikTok — как Gmail и Discord (создаются, если их ещё нет).
         have = {acc_platform(r_[0]) for r_ in await (await c.execute("SELECT name FROM categories")).fetchall()}
-        for key_, name_ in (("vk", "🔵 VK"), ("tiktok", "🔵 TikTok")):
+        for key_, name_ in (("vk", "💙 VK"), ("tiktok", "🎵 TikTok")):
             if key_ not in have:
                 await c.execute("INSERT INTO categories(name) VALUES(?)", (name_,))
 
@@ -574,6 +574,9 @@ TXT_ORDER_NEXT = (
 
 # key: (назва для адмінки, змінні, UA, RU)
 DT = {
+    "choose_lang": ("Выбор языка", "—",
+                    "🌐 Выберите язык интерфейса",
+                    "🌐 Выберите язык интерфейса"),
     "welcome": ("Главное меню", "—",
                 "👋 Добро пожаловать в <b>" + SHOP + " shop</b>!\n\n▪️ Аккаунты Gmail, Discord и Telegram\n▪️ Telegram Stars та Premium\n▪️ Баланс и цены в USD\n▪️ Автоматическое крипто-пополнение\n\nВыберите раздел:",
                 "👋 Приветствуем в <b>" + SHOP + " shop</b>!\n\n▪️ Аккаунты Gmail, Discord и Telegram\n▪️ Telegram Stars и Premium\n▪️ Баланс и цены в USD\n▪️ Крипто-пополнение\n\nВыберите раздел:"),
@@ -588,11 +591,11 @@ DT = {
               "<b>{name}</b>\n\nПоки що порожньо.", "<b>{name}</b>\n\nПока пусто."),
     "prod": ("Карточка товара", "{title} {price} {stock} {descr}",
              "<b>{title}</b>\n\n{descr}💰 Цена: <b>{price}</b>\n📦 В наличии: <b>{stock}</b>\n\nВыберите количество:",
-             "<b>{title}</b>\n\n{descr}💰 Цена: <b>{price}</b>\n📦 В наличии: <b>{stock}</b>\n\nВыберите количество:"),
+             "<b>{title}</b>\n\n{descr}💰 Цена: <b>{price}</b>\n📦 Наличие: <b>{stock}</b>\n\nВыберите количество:"),
     "country_prod": ("Карточка страны: цена и наличие", "{display_title} {country} {price} {stock_display}",
                      TXT_COUNTRY_PROD, TXT_COUNTRY_PROD),
     "on_order": ("Слово «под заказ» (в карточке)", "—", "на замовлення", "под заказ"),
-    "confirm": ("Подтверждение покупки", "{title} {qty} {price} {total}",
+    "confirm": ("Подтверждение покупки", "{title} {qty} {total}",
                 "Підтвердіть покупку:\n\n<b>{title}</b>\nКількість: {qty}\nДо сплати: <b>{total}</b>",
                 "Подтвердите покупку:\n\n<b>{title}</b>\nКоличество: {qty}\nК оплате: <b>{total}</b>"),
     "bought": ("Выдача со склада (текстом)", "{title} {qty} {total} {items}",
@@ -736,13 +739,6 @@ DT = {
 _ACC_LINE = "━━━━━━━━━━━━━━━━━━"
 _ACC_INFO = ("▫️ Аккаунты могут быть зарегистрированы в 2026 году или ранее.\n"
              "▫️ Зачастую это новореги — аккаунты с недавней регистрацией.\n")
-# Общие блоки подтверждения и выдачи (одинаковы для всех платформ).
-_ACC_CONFIRM_NOTES = ("▫️ Проверьте выбранный товар и количество.\n"
-                      "▫️ Формат выдачи: логин + пароль.\n"
-                      "▫️ После подтверждения заказа средства будут списаны с вашего баланса.")
-_ACC_REC = ("▫️ Сохраните данные для входа.\n"
-            "▫️ Проверьте возможность авторизации в аккаунте.\n"
-            "▫️ Если возникнут проблемы, обратитесь в поддержку.")
 ACC_PLATFORMS = {
     "gmail": dict(
         label="Gmail", emoji="📧",
@@ -751,24 +747,52 @@ ACC_PLATFORMS = {
         auth="📲 <b>Авторизация:</b> Без SMS-подтверждения*\n",
         info=_ACC_INFO + "▫️ Формат выдачи: логин + пароль.",
         confirm_item='<a href="https://gmail.com">Gmail.com</a> | Google-аккаунты',
+        confirm_notes=("▫️ Проверьте выбранный товар и количество.\n"
+                       "▫️ Убедитесь, что вас устраивает формат выдачи: логин + пароль.\n"
+                       "▫️ После подтверждения заказа сумма будет списана с вашего баланса."),
+        data_title="Данные для входа",
+        rec=("▫️ Сохраните данные для входа.\n"
+             "▫️ Проверьте доступ к аккаунту после авторизации.\n"
+             "▫️ Если возникнут проблемы со входом, обратитесь в поддержку."),
     ),
     "discord": dict(
         label="Discord", emoji="🎮",
-        head="Discord | Аккаунты", type="Discord", auth="",
+        head="Discord | Аккаунты", type="Discord-аккаунты", auth="",
         info=_ACC_INFO + "▫️ Данные для входа предоставляются после покупки.",
-        confirm_item="Discord | Аккаунты",
+        confirm_item="Discord",
+        confirm_notes=("▫️ Проверьте выбранный товар и количество.\n"
+                       "▫️ Учитывайте, что аккаунт может быть зарегистрирован в 2026 году или ранее, чаще всего это новорег.\n"
+                       "▫️ Формат выдачи: логин + пароль."),
+        data_title="Ваши данные для входа",
+        rec=("▫️ Сохраните данные для входа.\n"
+             "▫️ Проверьте возможность авторизации в Discord.\n"
+             "▫️ Если возникнут проблемы со входом, обратитесь в поддержку."),
     ),
     "vk": dict(
-        label="VK", emoji="🔵",
-        head="VK | Аккаунты", type="ВКонтакте", auth="",
+        label="VK", emoji="💙",
+        head="VK | Аккаунты", type="VK-аккаунты", auth="",
         info=_ACC_INFO + "▫️ Данные для входа предоставляются после покупки.",
-        confirm_item="VK | Аккаунты",
+        confirm_item="VK",
+        confirm_notes=("▫️ Проверьте выбранный товар и количество.\n"
+                       "▫️ Учитывайте, что аккаунт может быть зарегистрирован в 2026 году или ранее, чаще всего это новорег.\n"
+                       "▫️ Формат выдачи: логин + пароль."),
+        data_title="Ваши данные для входа",
+        rec=("▫️ Сохраните данные для входа.\n"
+             "▫️ Проверьте возможность авторизации в VK.\n"
+             "▫️ Если возникнут проблемы со входом, обратитесь в поддержку."),
     ),
     "tiktok": dict(
-        label="TikTok", emoji="🔵",
-        head="TikTok | Аккаунты", type="TikTok", auth="",
+        label="TikTok", emoji="🎵",
+        head="TikTok | Аккаунты", type="TikTok-аккаунты", auth="",
         info=_ACC_INFO + "▫️ Данные для входа предоставляются после покупки.",
-        confirm_item="TikTok | Аккаунты",
+        confirm_item="TikTok",
+        confirm_notes=("▫️ Проверьте выбранный товар и количество.\n"
+                       "▫️ Учитывайте, что аккаунт может быть зарегистрирован в 2026 году или ранее, чаще всего это новорег.\n"
+                       "▫️ Формат выдачи: логин + пароль."),
+        data_title="Ваши данные для входа",
+        rec=("▫️ Сохраните данные для входа.\n"
+             "▫️ Проверьте возможность авторизации в TikTok.\n"
+             "▫️ Если возникнут проблемы со входом, обратитесь в поддержку."),
     ),
 }
 ACC_CAT_RE = {
@@ -806,27 +830,27 @@ def _acc_texts(key, cfg):
         "🛒 <b>Подтверждение покупки</b>\n\n"
         f"{em} <b>Товар:</b> {cfg['confirm_item']}\n"
         "📦 <b>Количество:</b> {qty} шт.\n"
-        "💰 <b>Цена за 1 шт.:</b> {price}\n"
-        "💳 <b>К оплате:</b> {total}\n\n"
+        "💰 <b>К оплате:</b> {total}\n\n"
         f"{_ACC_LINE}\n\n"
-        f"<blockquote>⚠️ <b>Перед покупкой</b>\n\n{_ACC_CONFIRM_NOTES}</blockquote>\n\n"
+        f"<blockquote>⚠️ <b>Перед подтверждением</b>\n\n{cfg['confirm_notes']}</blockquote>\n\n"
         "👇 <b>Нажмите кнопку ниже, чтобы подтвердить покупку.</b>"
     )
     bought = (
         "✅ <b>Покупка успешно завершена!</b>\n\n"
-        f"{em} <b>{cfg['label']} × " + "{qty}</b>\n"
-        "💰 <b>Списано с баланса:</b> {total}\n\n"
+        f"{em} <b>{head}</b>\n"
+        "📦 Количество: {qty} шт\n"
+        "💰 <b>Списано с баланса:</b> {total}\n"
         f"{_ACC_LINE}\n\n"
-        "🔐 <b>Ваши данные для входа</b>\n"
+        f"🔐 <b>{cfg['data_title']}</b>\n"
         "{items}\n\n"
         f"{_ACC_LINE}\n\n"
-        f"<blockquote>📋 <b>Рекомендации</b>\n\n{_ACC_REC}</blockquote>\n\n"
+        f"<blockquote>📋 <b>Рекомендации</b>\n\n{cfg['rec']}</blockquote>\n\n"
         "⚠️ <b>Не передавайте данные третьим лицам.</b>"
     )
     lb = cfg["label"]
     return {
         f"acc_prod_{key}": (f"{lb}: карточка товара", "{price} {stock_display} {title}", prod, prod),
-        f"acc_confirm_{key}": (f"{lb}: подтверждение покупки", "{qty} {price} {total} {title}", confirm, confirm),
+        f"acc_confirm_{key}": (f"{lb}: подтверждение покупки", "{qty} {total} {title}", confirm, confirm),
         f"acc_bought_{key}": (f"{lb}: выдача после покупки", "{qty} {total} {items} {title}", bought, bought),
     }
 
@@ -848,6 +872,7 @@ DB_ = {
     "profile": ("Меню: Профиль", "👤 Профиль", "👤 Профиль"),
     "balance": ("Меню: Баланс", "💼 Баланс", "💼 Баланс"),
     "history": ("Меню: История покупок", "📖 Історія покупок", "📖 История покупок"),
+    "lang": ("Меню: Язык", "🌐 Язык интерфейса", "🌐 Язык интерфейса"),
     "admin": ("Меню: Админ-панель", "🛠 Адмін-панель", "🛠 Админ-панель"),
     "support": ("Кнопка поддержки", "🆘 Поддержка", "🆘 Поддержка"),
     "back": ("Кнопка «Назад»", "⬅️ Назад", "⬅️ Назад"),
@@ -858,6 +883,8 @@ DB_ = {
     "dep_hist": ("История депозитов", "🧾 Історія депозитів", "🧾 История депозитов"),
     "send_receipt": ("Отправить квитанцию", "🧾 Надіслати квитанцію", "🧾 Отправить квитанцию"),
     "sub_check": ("Я подписался", "✅ Я підписався", "✅ Я подписался"),
+    "lang_ua": ("Выбор языка: UA", "🇷🇺 Русский", "🇷🇺 Русский"),
+    "lang_ru": ("Выбор языка: RU", "🇷🇺 Русский", "🇷🇺 Русский"),
     "search": ("Каталог: Поиск", "🔍 Пошук", "🔍 Поиск"),
     "search_reset": ("Каталог: Сбросить поиск", "✖️ Скинути пошук", "✖️ Сбросить поиск"),
     "sort_name": ("Каталог: сортировка по названию", "Назва", "Название"),
@@ -892,17 +919,6 @@ async def sync_country_order_ui():
     await q("INSERT INTO ui_btn(key,lang,label,emoji_id) VALUES(?,?,?,NULL) "
             "ON CONFLICT(key,lang) DO UPDATE SET label=excluded.label, emoji_id=NULL",
             ("req_code", "ru", "📩 Получить код"))
-
-    # Язык один — русский: всем пользователям ставим ru, мёртвые записи выбора языка чистим.
-    await q("UPDATE users SET lang='ru' WHERE lang IS NULL OR lang!='ru'")
-    await q("DELETE FROM ui_text WHERE key='choose_lang'")
-    await q("DELETE FROM ui_btn WHERE key IN ('lang','lang_ua','lang_ru')")
-
-    # Один раз сбрасываем ранее сохранённые тексты каталогов аккаунтов (acc_*), чтобы применились новые шаблоны.
-    # Дальше их можно спокойно менять в админке — повторно перезаписываться они не будут.
-    if not await q("SELECT v FROM settings WHERE k='acc_texts_v3'", fetch="one"):
-        await q("UPDATE ui_text SET html=NULL WHERE key LIKE 'acc\\_%' ESCAPE '\\'")
-        await q("INSERT OR REPLACE INTO settings(k,v) VALUES('acc_texts_v3','1')")
 
     # В уже настроенных этапах заказа приводим подписи к русскому языку.
     for table, where in (("products", "steps IS NOT NULL AND steps != ''"),
@@ -1123,6 +1139,10 @@ async def lang_of(uid):
     return "ru"
 
 
+def lang_kb():
+    return kb([[B("ru", "lang_ru", "lang:ru")]])
+
+
 async def main_menu(ev, uid):
     L = await lang_of(uid)
     rows = [[B(L, "shop", "m:shop")],
@@ -1135,7 +1155,7 @@ async def main_menu(ev, uid):
     await screen(ev, "welcome", L, kb(rows))
 
 
-# ───────────────────────── Обязательная подписка ─────────────────────────
+# ───────────────────────── Обов'язкова підписка + мова ─────────────────────────
 SUB_OK = {}
 
 
@@ -1173,18 +1193,22 @@ class Gate(BaseMiddleware):
         user = event.from_user
         if not user or user.is_bot:
             return True
-        # Язык интерфейса один — русский, поэтому выбор языка пользователю не показываем.
-        await q("INSERT OR IGNORE INTO users(id,username,lang,created) VALUES(?,?,'ru',?)", (user.id, user.username, now()))
-        await q("UPDATE users SET username=?, lang='ru' WHERE id=?", (user.username, user.id))
-        row = await q("SELECT banned FROM users WHERE id=?", (user.id,), "one")
-        lang = "ru"
+        await q("INSERT OR IGNORE INTO users(id,username,created) VALUES(?,?,?)", (user.id, user.username, now()))
+        await q("UPDATE users SET username=? WHERE id=?", (user.username, user.id))
+        row = await q("SELECT lang, banned FROM users WHERE id=?", (user.id,), "one")
+        lang = row["lang"]
         cd = (event.data or "") if isinstance(event, CallbackQuery) else ""
+        if not lang:
+            if cd.startswith("lang:"):
+                return True
+            await screen(event, "choose_lang", "ru", lang_kb())
+            return False
         role = await role_of(user.id)
         if role in ("owner", "admin"):
             return True
         if SET.get("legacy_uah_pending") == "1":
             try:
-                await event.answer("Магазин временно настраивается: идёт переход на USD. Попробуйте чуть позже.", show_alert=True) if isinstance(event, CallbackQuery) else await event.answer("Магазин временно настраивается: идёт переход на USD. Попробуйте чуть позже.")
+                await event.answer("Магазин тимчасово на налаштуванні валюти. Адміністратор має завершити перехід на USD.", show_alert=True) if isinstance(event, CallbackQuery) else await event.answer("Магазин тимчасово на налаштуванні валюти. Адміністратор має завершити перехід на USD.")
             except Exception:
                 pass
             return False
@@ -1196,7 +1220,7 @@ class Gate(BaseMiddleware):
             except Exception:
                 pass
             return False
-        if cd == "chk_sub":
+        if cd in ("chk_sub", "m:lang") or cd.startswith("lang:"):
             return True
         miss = await missing_channels(data["bot"], user.id)
         if miss:
@@ -1230,17 +1254,22 @@ r.callback_query.outer_middleware(Gate())
 r.message.filter(F.chat.type == "private")  # бот не реагирует в группах
 
 
-# ───────────────────────── Пользователь: старт ─────────────────────────
+# ───────────────────────── Користувач: старт / мова ─────────────────────────
 @r.message(CommandStart())
 async def cmd_start(m: Message, state: FSMContext):
     await reset_state(state, m.from_user.id)
     await main_menu(m, m.from_user.id)
 
 
-@r.callback_query(F.data.startswith("lang:") | (F.data == "m:lang"))
-async def old_lang_button(c: CallbackQuery):
-    # Кнопки выбора языка из старых сообщений: просто открываем главное меню.
+@r.callback_query(F.data.startswith("lang:"))
+async def set_lang(c: CallbackQuery):
+    await q("UPDATE users SET lang='ru' WHERE id=?", (c.from_user.id,))
     await main_menu(c, c.from_user.id)
+
+
+@r.callback_query(F.data == "m:lang")
+async def pick_lang(c: CallbackQuery):
+    await screen(c, "choose_lang", "ru", lang_kb())
 
 
 @r.callback_query(F.data == "chk_sub")
@@ -1295,11 +1324,11 @@ def parse_int(text, lo, hi):
 def month_label(L, n):
     n = int(n)
     if n % 10 == 1 and n % 100 != 11:
-        w = "месяц"
+        w = "місяць" if L == "ua" else "месяц"
     elif 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
-        w = "месяца"
+        w = "місяці" if L == "ua" else "месяца"
     else:
-        w = "месяцев"
+        w = "місяців" if L == "ua" else "месяцев"
     return f"{n} {w}"
 
 
@@ -1706,8 +1735,6 @@ async def shop_prod(c: CallbackQuery, state: FSMContext):
     first = await q("SELECT mode FROM stock WHERE product_id=? AND sold=0 ORDER BY id LIMIT 1", (pid,), "one")
     if first and first["mode"] == "code" and not is_manual(p):  # номера — по одному
         rows = [[B(L, "pay", f"s:c:{pid}:1")], [B(L, "back", f"s:cat:{p['cat_id']}")]]
-    elif not is_manual(p) and n <= 0:  # товара нет — кнопки покупки не показываем
-        rows = [[B(L, "back", f"s:cat:{p['cat_id']}")]]
     else:
         ks = [k for k in (1, 5, 10, 25) if is_manual(p) or k <= n] or [1]
         rows = [[btn(str(k), f"s:c:{pid}:{k}") for k in ks],
@@ -1759,18 +1786,12 @@ async def confirm(ev, L, pid, qty):
     p = await q("SELECT * FROM products WHERE id=? AND active=1", (pid,), "one")
     if not p:
         return await ev.answer(alert_text(L, "no_stock"))
-    if not is_manual(p):  # нельзя оформить больше, чем есть на складе
-        have = (await q("SELECT COUNT(*) AS n FROM stock WHERE product_id=? AND sold=0", (pid,), "one"))["n"]
-        if qty > have:
-            if isinstance(ev, CallbackQuery):
-                return await ev.answer(alert_text(L, "no_stock"), show_alert=True)
-            return await ev.answer(plain(txt(L, "no_stock")) + f" Доступно: {have} шт.")
     rows = [[B(L, "pay", f"s:ok:{pid}:{qty}"), B(L, "cancel", f"s:p:{pid}")]]
     acc = None if is_manual(p) else await acc_kind(pid)
-    kw = dict(title=html.escape(p["title"]), qty=qty, price=money(p["price"]), total=money(p["price"] * qty))
     if acc:
-        return await screen(ev, f"acc_confirm_{acc}", L, kb(rows), **kw)
-    await screen(ev, "confirm", L, kb(rows), **kw)
+        return await screen(ev, f"acc_confirm_{acc}", L, kb(rows), title=html.escape(p["title"]), qty=qty,
+                            total=money(p["price"] * qty))
+    await screen(ev, "confirm", L, kb(rows), title=html.escape(p["title"]), qty=qty, total=money(p["price"] * qty))
 
 
 @r.callback_query(F.data.startswith("s:c:"))
@@ -2101,7 +2122,10 @@ async def crypto_pending(bot, only_id=None):
     except Exception:
         logging.warning("Crypto Pay invoice check temporarily failed", exc_info=True)
         return
-    by_id = {str(x.get("invoice_id")): x for x in (invoices or [])}
+    # Crypto Pay API повертає {"items": [...]} (старі версії — просто список)
+    if isinstance(invoices, dict):
+        invoices = invoices.get("items") or []
+    by_id = {str(x.get("invoice_id")): x for x in (invoices or []) if isinstance(x, dict)}
     for item in pending:
         inv = by_id.get(str(item["external_id"]))
         if not inv:
@@ -2218,7 +2242,7 @@ async def tp_uah(c: CallbackQuery, state: FSMContext):
     rate = parse_num(SET.get("uah_per_usd"), 0.01, 1_000_000)
     reqs = await q("SELECT * FROM requisites", fetch="all")
     if not reqs or not rate:
-        return await c.answer("Банковское пополнение не настроено.", show_alert=True)
+        return await c.answer("Банківське поповнення не налаштовано.", show_alert=True)
     rows = [[mk_btn(f"🏦 {x['bank']}" if not x["emoji_id"] else x["bank"], f"tp:r:{x['id']}", x["emoji_id"])] for x in reqs]
     rows.append([B(await lang_of(c.from_user.id), "back", "tp:start")])
     await show(c, f"🏦 <b>Оплата гривной</b>\n\nКурс администратора: 1 USD = {rate:.4f} UAH.\nБаланс будет зачислен в USD.", kb(rows))
@@ -2231,10 +2255,10 @@ async def tp_req(c: CallbackQuery, state: FSMContext):
         return await c.answer("Администратор ещё не настроил курс UAH/USD.", show_alert=True)
     req_id = int(c.data.split(":")[2])
     if not await q("SELECT id FROM requisites WHERE id=?", (req_id,), "one"):
-        return await c.answer("Реквизиты не найдены.", show_alert=True)
+        return await c.answer("Реквізити не знайдені.", show_alert=True)
     await state.set_state(Topup.amount)
     await state.update_data(req=req_id)
-    await show(c, f"Введите сумму оплаты в UAH (минимум {MIN_TOPUP:.2f} UAH).\nКурс: 1 USD = {rate:.4f} UAH. На баланс поступит сумма в USD.",
+    await show(c, f"Введите сумму оплаты в UAH (мінімум {MIN_TOPUP:.2f} UAH).\nКурс: 1 USD = {rate:.4f} UAH. На баланс надійде сума в USD.",
                kb([[B(await lang_of(c.from_user.id), "cancel", "tp:start")]]))
 
 
@@ -2270,9 +2294,9 @@ async def tp_amount(m: Message, state: FSMContext):
 async def tp_crypto(c: CallbackQuery, state: FSMContext):
     await state.clear()
     if not SET.get("cryptobot_token"):
-        return await c.answer("Crypto Bot не настроен администратором.", show_alert=True)
+        return await c.answer("Crypto Bot не налаштовано адміністратором.", show_alert=True)
     await state.set_state(Topup.crypto_amount)
-    await show(c, f"Введите сумму пополнения в USD (минимум {money(MIN_TOPUP_USD)}). Оплата будет через Crypto Bot в USDT.",
+    await show(c, f"Введите сумму пополнения в USD (мінімум {money(MIN_TOPUP_USD)}). Оплата будет через Crypto Bot у USDT.",
                kb([[B(await lang_of(c.from_user.id), "cancel", "tp:start")]]))
 
 
@@ -2285,13 +2309,13 @@ async def tp_crypto_amount(m: Message, state: FSMContext):
     try:
         pid, pay_url = await create_crypto_intent(m.from_user.id, usd)
     except Exception:
-        return await m.answer("Не удалось создать счёт Crypto Bot. Проверьте настройки или попробуйте позже.",
-                              reply_markup=kb([[btn("⬅️ К балансу", "m:bal")]]))
+        return await m.answer("Не вдалося створити рахунок Crypto Bot. Перевірте налаштування або спробуйте пізніше.",
+                              reply_markup=kb([[btn("⬅️ До балансу", "m:bal")]]))
     await m.answer(
         f"🤖 <b>Рахунок Crypto Bot №{pid}</b>\n\nДо оплати: <b>{money(usd)} USDT</b>\n"
         "После успешной оплаты баланс будет автоматически зачислен в USD. Счёт действует 60 минут.",
-        reply_markup=kb([[btn("💎 Оплатить в Crypto Bot", url=pay_url)], [btn("🔄 Проверить оплату", f"tp:check:{pid}")],
-                         [btn("⬅️ К балансу", "m:bal")]])
+        reply_markup=kb([[btn("💎 Сплатити в Crypto Bot", url=pay_url)], [btn("🔄 Перевірити оплату", f"tp:check:{pid}")],
+                         [btn("⬅️ До балансу", "m:bal")]])
     )
 
 
@@ -2300,9 +2324,9 @@ async def tp_ton(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rate = parse_num(SET.get("ton_usd"), 0.000001, 1_000_000_000)
     if not SET.get("ton_wallet") or not SET.get("toncenter_api_key") or not rate:
-        return await c.answer("TON-оплата не настроена администратором.", show_alert=True)
+        return await c.answer("TON-оплата не налаштована адміністратором.", show_alert=True)
     await state.set_state(Topup.ton_amount)
-    await show(c, f"Введите сумму пополнения в USD (минимум {money(MIN_TOPUP_USD)}).\nКурс администратора: 1 TON = ${rate:.6f}.",
+    await show(c, f"Введите сумму пополнения в USD (мінімум {money(MIN_TOPUP_USD)}).\nКурс администратора: 1 TON = ${rate:.6f}.",
                kb([[B(await lang_of(c.from_user.id), "cancel", "tp:start")]]))
 
 
@@ -2315,14 +2339,14 @@ async def tp_ton_amount(m: Message, state: FSMContext):
     try:
         pid, pay_url, ton_amount = await create_ton_intent(m.from_user.id, usd)
     except Exception:
-        return await m.answer("Не удалось создать TON-платёж. Проверьте платёжные настройки или попробуйте позже.",
-                              reply_markup=kb([[btn("⬅️ К балансу", "m:bal")]]))
+        return await m.answer("Не вдалося створити TON-платіж. Перевірте платіжні налаштування або спробуйте пізніше.",
+                              reply_markup=kb([[btn("⬅️ До балансу", "m:bal")]]))
     await m.answer(
         f"💎 <b>TON-поповнення №{pid}</b>\n\nДо оплати: <b>{ton_amount:.9f} TON</b>\n"
-        f"Зачисление на баланс: <b>{money(usd)}</b>\nКомментарий платежа должен быть <code>VH{pid}</code> — он добавляется автоматически в ссылке Tonkeeper.\n"
+        f"Кредит на баланс: <b>{money(usd)}</b>\nКоментар платежу має бути <code>VH{pid}</code> — він додається автоматично у посиланні Tonkeeper.\n"
         "После поступления перевода баланс будет зачислен автоматически.",
-        reply_markup=kb([[btn("💎 Открыть Tonkeeper", url=pay_url)], [btn("🔄 Проверить оплату", f"tp:check:{pid}")],
-                         [btn("⬅️ К балансу", "m:bal")]])
+        reply_markup=kb([[btn("💎 Відкрити Tonkeeper", url=pay_url)], [btn("🔄 Перевірити оплату", f"tp:check:{pid}")],
+                         [btn("⬅️ До балансу", "m:bal")]])
     )
 
 
@@ -2331,20 +2355,23 @@ async def tp_check(c: CallbackQuery, bot: Bot):
     pid = int(c.data.split(":")[2])
     item = await q("SELECT * FROM payment_intents WHERE id=? AND user_id=?", (pid, c.from_user.id), "one")
     if not item:
-        return await c.answer("Платёж не найден.", show_alert=True)
+        return await c.answer("Платіж не знайдено.", show_alert=True)
     if item["status"] == "pending":
-        if item["method"] == "cryptobot":
-            await crypto_pending(bot, pid)
-        elif item["method"] == "ton":
-            await ton_pending(bot, pid)
+        try:
+            if item["method"] == "cryptobot":
+                await crypto_pending(bot, pid)
+            elif item["method"] == "ton":
+                await ton_pending(bot, pid)
+        except Exception:
+            logging.exception("Manual payment check failed (intent %s)", pid)
         item = await q("SELECT * FROM payment_intents WHERE id=?", (pid,), "one")
     if item["status"] == "paid":
-        return await c.answer(f"Оплата подтверждена: {money(item['usd_amount'])} зачислено.", show_alert=True)
+        return await c.answer(f"Оплату підтверджено: {money(item['usd_amount'])} зараховано.", show_alert=True)
     if item["status"] == "expired":
-        return await c.answer("Счёт просрочен. Создайте новый платёж.", show_alert=True)
+        return await c.answer("Рахунок прострочений. Створіть новий платіж.", show_alert=True)
     if item["status"] == "failed":
-        return await c.answer("Счёт не создан. Создайте новый платёж или обратитесь в поддержку.", show_alert=True)
-    await c.answer("Платёж пока не найден. Если уже оплатили, дождитесь подтверждения сети и проверьте ещё раз.", show_alert=True)
+        return await c.answer("Рахунок не створено. Створіть новий платіж або зверніться в підтримку.", show_alert=True)
+    await c.answer("Платіж ще не знайдено. Якщо вже сплатили, зачекайте підтвердження мережі та перевірте ще раз.", show_alert=True)
 
 
 @r.callback_query(F.data.startswith("tp:s:"))
@@ -2731,7 +2758,7 @@ async def a_stock_item(c: CallbackQuery):
         return await c.answer("Позиция не найдена или уже продана.", show_alert=True)
     login = html.escape(str(item["login"] or "—"))
     if item["mode"] == "code":
-        pass_text = "код запрашивается отдельно"
+        pass_text = "код запитується окремо"
     elif item["mode"] == "pw":
         pass_text = html.escape(str(item["pw"] or "—"))
     else:
@@ -2761,7 +2788,7 @@ async def f_stock_pw(c: CallbackQuery, state: FSMContext):
     item = await q("SELECT id,product_id FROM stock WHERE id=? AND sold=0", (sid,), "one")
     if not item:
         return await c.answer("Позиция не найдена или уже продана.", show_alert=True)
-    await start_edit(c, state, "stock_pw", "Отправьте новый пароль, или «-» (без пароля), или «+» (код запрашивается отдельно):",
+    await start_edit(c, state, "stock_pw", "Отправьте новый пароль, или «-» (без пароля), або «+» (код запитується окремо):",
                      f"a:stockitem:{sid}", id=sid, pid=item["product_id"])
 
 
@@ -2933,14 +2960,14 @@ async def edit_input(m: Message, state: FSMContext):
     elif kind == "stock_login":
         login = (m.text or "").strip()
         if not login or len(login) > 512:
-            return await m.answer("Отправьте корректный номер / логин (до 512 символов).")
+            return await m.answer("Отправьте корректный номер / логин (до 512 символів).")
         changed = await qr("UPDATE stock SET login=? WHERE id=? AND sold=0", (login, d["id"]))
         if not changed:
             return await m.answer("Позиция не найдена или уже продана. Список не изменён.")
     elif kind == "stock_pw":
         pw = (m.text or "").strip()
         if not pw or len(pw) > 512:
-            return await m.answer("Отправьте пароль, «-» или «+» (до 512 символов).")
+            return await m.answer("Отправьте пароль, «-» або «+» (до 512 символів).")
         item = await q("SELECT product_id FROM stock WHERE id=? AND sold=0", (d["id"],), "one")
         if not item:
             return await m.answer("Позиция не найдена или уже продана. Список не изменён.")
@@ -3417,11 +3444,11 @@ async def f_payments(c: CallbackQuery, state: FSMContext):
         [btn("🔑 Встановити TON Center API key", "f:pay:edit:toncenter_api_key")],
         [btn("💱 Курс UAH за 1 USD", "f:pay:edit:uah_per_usd"),
          btn("💎 Курс USD за 1 TON", "f:pay:edit:ton_usd")],
-        [btn("🧪 Проверить Crypto Bot", "f:pay:testcrypto"), btn("🧪 Проверить TON Center", "f:pay:testton")],
+        [btn("🧪 Перевірити Crypto Bot", "f:pay:testcrypto"), btn("🧪 Перевірити TON Center", "f:pay:testton")],
     ]
     if legacy_pending:
         rows.append([btn("🔄 Конвертувати старі UAH-суми в USD", "f:pay:migrate")])
-    rows.append([btn("⬅️ Админ-панель", "a:home")])
+    rows.append([btn("⬅️ Адмін-панель", "a:home")])
     await show(c, text, kb(rows))
 
 
@@ -3429,11 +3456,11 @@ async def f_payments(c: CallbackQuery, state: FSMContext):
 async def f_pay_edit(c: CallbackQuery, state: FSMContext):
     kind = c.data.split(":", 3)[3]
     prompts = {
-        "cryptobot_token": "Отправьте Crypto Pay API token от @CryptoBot. Сообщение будет удалено после получения.",
+        "cryptobot_token": "Надішліть Crypto Pay API token від @CryptoBot. Сообщение будет удалено после получения.",
         "ton_wallet": "Отправьте адрес TON-кошелька, на который покупатели должны переводить TON.",
         "toncenter_api_key": "Отправьте TON Center API key. Сообщение будет удалено после получения.",
-        "uah_per_usd": "Укажите, сколько гривен стоит 1 USD (например, 41.50). Это курс для банковского пополнения.",
-        "ton_usd": "Укажите, сколько USD стоит 1 TON (например, 5.25). Это курс для TON-пополнения.",
+        "uah_per_usd": "Вкажіть, скільки гривень коштує 1 USD (наприклад, 41.50). Це курс для банківського поповнення.",
+        "ton_usd": "Вкажіть, скільки USD коштує 1 TON (наприклад, 5.25). Це курс для TON-поповнення.",
     }
     if kind not in prompts:
         return await c.answer()
@@ -3447,10 +3474,10 @@ async def f_pay_test_crypto(c: CallbackQuery):
     try:
         info = await crypto_api("getMe", {})
         name = html.escape(str(info.get("name") or info.get("app_name") or "Crypto Pay app"))
-        await c.answer(f"API отвечает: {name}", show_alert=True)
+        await c.answer(f"API відповідає: {name}", show_alert=True)
     except Exception:
         logging.warning("Crypto Pay credentials test failed", exc_info=True)
-        await c.answer("Проверка не пройдена. Проверьте токен и доступ к API.", show_alert=True)
+        await c.answer("Перевірка не пройшла. Перевірте токен та доступ до API.", show_alert=True)
 
 
 @r.callback_query(F.data == "f:pay:testton", Full())
@@ -3459,21 +3486,21 @@ async def f_pay_test_ton(c: CallbackQuery):
         return await c.answer("Спочатку задайте TON-адресу та TON Center API key.", show_alert=True)
     try:
         await ton_transactions()
-        await c.answer("TON Center API доступен, история транзакций получена.", show_alert=True)
+        await c.answer("TON Center API доступний, історію транзакцій отримано.", show_alert=True)
     except Exception:
         logging.warning("TON Center credentials test failed", exc_info=True)
-        await c.answer("Проверка не пройдена. Проверьте адрес, API key и доступ к TON Center.", show_alert=True)
+        await c.answer("Перевірка не пройшла. Перевірте адресу, API key та доступ до TON Center.", show_alert=True)
 
 
 @r.callback_query(F.data == "f:pay:migrate", Full())
 async def f_pay_migrate(c: CallbackQuery):
     if SET.get("legacy_uah_pending") != "1":
-        return await c.answer("Конвертация уже выполнена или не нужна.", show_alert=True)
+        return await c.answer("Конвертація вже виконана або не потрібна.", show_alert=True)
     rate = parse_num(SET.get("uah_per_usd"), 0.01, 1_000_000)
     if not rate:
-        return await c.answer("Сначала установите курс UAH/USD.", show_alert=True)
+        return await c.answer("Спочатку встановіть курс UAH/USD.", show_alert=True)
     await show(c,
-        f"⚠️ <b>Конвертация старых сумм</b>\n\nПо курсу 1 USD = {rate:.4f} UAH будут единоразово пересчитаны балансы пользователей, текущие цены товаров, Stars/Premium, исторические заказы и депозиты.\n\nПроверьте курс и сделайте копию файла базы данных перед продолжением.",
+        f"⚠️ <b>Конвертація старих сум</b>\n\nЗа курсом 1 USD = {rate:.4f} UAH буде одноразово перераховано баланси користувачів, поточні ціни товарів, Stars/Premium, історичні замовлення та депозити.\n\nПеревірте курс і зробіть копію файлу бази даних перед продовженням.",
         kb([[btn("✅ Так, конвертувати", "f:pay:migrate:yes")], [btn("✖️ Скасувати", "f:payments")]])
     )
 
@@ -3481,10 +3508,10 @@ async def f_pay_migrate(c: CallbackQuery):
 @r.callback_query(F.data == "f:pay:migrate:yes", Full())
 async def f_pay_migrate_yes(c: CallbackQuery):
     if SET.get("legacy_uah_pending") != "1":
-        return await c.answer("Конвертация уже выполнена.", show_alert=True)
+        return await c.answer("Конвертацію вже виконано.", show_alert=True)
     rate = parse_num(SET.get("uah_per_usd"), 0.01, 1_000_000)
     if not rate:
-        return await c.answer("Сначала установите курс UAH/USD.", show_alert=True)
+        return await c.answer("Спочатку встановіть курс UAH/USD.", show_alert=True)
     async with conn() as db:
         await db.execute("BEGIN IMMEDIATE")
         await db.execute("UPDATE deposits SET paid_amount=COALESCE(paid_amount,amount), currency=COALESCE(currency,'UAH')")
@@ -3510,8 +3537,8 @@ async def f_pay_migrate_yes(c: CallbackQuery):
         await db.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('currency_migration_completed','1')")
         await db.commit()
     await reload_ui()
-    await show(c, "✅ Старые финансовые суммы конвертированы в USD. Проверьте несколько товаров и балансов.",
-               kb([[btn("💳 Платежі / курси", "f:payments")], [btn("⬅️ Админ-панель", "a:home")]]))
+    await show(c, "✅ Старі фінансові суми конвертовано в USD. Перевірте кілька товарів і балансів.",
+               kb([[btn("💳 Платежі / курси", "f:payments")], [btn("⬅️ Адмін-панель", "a:home")]]))
 
 
 # ---- Настройки / поддержка
@@ -3601,7 +3628,7 @@ async def user_card(uid):
     o = await q("SELECT COUNT(*) n, COALESCE(SUM(total),0) s FROM orders WHERE user_id=? AND status!='refunded'", (uid,), "one")
     d = await q("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE user_id=? AND status='approved'", (uid,), "one")
     text = (f"👤 <b>Пользователь</b> <code>{uid}</code>{' @' + u['username'] if u['username'] else ''}\n"
-            f"Регистрация: {u['created']}\n💎 Баланс: {money(u['balance'])}\n"
+            f"Язык: {u['lang'] or '—'} • регистрация: {u['created']}\n💎 Баланс: {money(u['balance'])}\n"
             f"🛒 Заказов: {o['n']} на {money(o['s'])}\n💳 Пополнено: {money(d['s'])}\n"
             f"Статус: {'🚫 заблокирован' if u['banned'] else '✅ активен'}")
     mk = kb([[btn("✅ Разблокировать" if u["banned"] else "🚫 Заблокировать", f"f:ub:{uid}:{0 if u['banned'] else 1}")],
