@@ -1,5 +1,5 @@
 """
-vh shop bot v3 — Telegram магазин аккаунтов (Gmail / Discord) + Telegram Stars / Premium
+vh shop bot v3 — Telegram магазин аккаунтов (Gmail / Discord) + Telegram Stars / Premium (оплата: Crypto Bot, xRocket, TON, карта)
 aiogram >= 3.27 + SQLite.
 
 • ручная пошаговая выдача (заявки админу: номер → код, аккаунт → пароль ...)
@@ -42,6 +42,7 @@ SUPPORT_ENV = os.getenv("SUPPORT_USERNAME", "").lstrip("@")
 MIN_TOPUP = float(os.getenv("MIN_TOPUP_UAH", os.getenv("MIN_TOPUP", "50")))  # Минимум для ручного пополнения в гривне.
 MIN_TOPUP_USD = float(os.getenv("MIN_TOPUP_USD", "1"))
 DB = os.getenv("DB_PATH", "vh.db")
+XROCKET_API_URL = os.getenv("XROCKET_API_URL", "https://pay.xrocket.tg").rstrip("/")
 SHOP = "vh"
 
 
@@ -293,6 +294,8 @@ MIGRATIONS = [  # для баз, созданных старой версией
     "ALTER TABLE products ADD COLUMN emoji_id TEXT", "ALTER TABLE products ADD COLUMN mtype TEXT",
     "ALTER TABLE products ADD COLUMN mfile TEXT", "ALTER TABLE products ADD COLUMN descr TEXT",
     "ALTER TABLE products ADD COLUMN steps TEXT", "ALTER TABLE products ADD COLUMN stock_qty INTEGER DEFAULT -1",
+    "ALTER TABLE products ADD COLUMN paid_text TEXT", "ALTER TABLE products ADD COLUMN next_text TEXT",
+    "ALTER TABLE products ADD COLUMN wait_text TEXT", "ALTER TABLE orders ADD COLUMN wait_msg_id INTEGER",
     "ALTER TABLE orders ADD COLUMN status TEXT DEFAULT 'done'", "ALTER TABLE orders ADD COLUMN step INTEGER DEFAULT 0",
     "ALTER TABLE orders ADD COLUMN pending INTEGER DEFAULT 0", "ALTER TABLE orders ADD COLUMN claimed_by INTEGER",
     "ALTER TABLE orders ADD COLUMN steps TEXT",
@@ -339,27 +342,9 @@ async def init_db():
             await c.executemany("INSERT INTO premium_plans(months,price) VALUES(?,?)", [(3, 16.0), (6, 21.0), (12, 35.0)])
             await c.execute("INSERT INTO settings(k,v) VALUES('plans_seeded','1')")
 
-        n = await (await c.execute("SELECT COUNT(*) FROM categories")).fetchone()
-        if n[0] == 0:
-            await c.executemany("INSERT INTO categories(name) VALUES(?)", [("📧 Gmail",), ("🎮 Discord",)])
-
-        # Нормализуем название категории, в том числе в существующей базе.
-        await c.execute("UPDATE categories SET name='📱 Telegram аккаунты' WHERE name IN ('📱 Telegram акаунти','Telegram акаунти')")
-        catrow = await (await c.execute(
-            "SELECT id FROM categories WHERE lower(name) LIKE '%telegram%' OR lower(name) LIKE '%телеграм%' LIMIT 1"
-        )).fetchone()
-        if not catrow:
-            cur = await c.execute("INSERT INTO categories(name) VALUES(?)", ("📱 Telegram аккаунты",))
-            tg_cat_id = cur.lastrowid
-        else:
-            tg_cat_id = int(catrow[0])
-
-        # Каталоги VK и TikTok — как Gmail и Discord (создаются, если их ещё нет).
-        have = {acc_platform(r_[0]) for r_ in await (await c.execute("SELECT name FROM categories")).fetchall()}
-        for key_, name_ in (("vk", "💙 VK"), ("tiktok", "🎵 TikTok")):
-            if key_ not in have:
-                await c.execute("INSERT INTO categories(name) VALUES(?)", (name_,))
-
+        # Каталог (категории и страны Telegram) наполняется ОДИН раз — только в новой пустой базе.
+        # В существующей базе всё, что ты менял/удалял/добавлял, остаётся как есть.
+        catalog_done = await (await c.execute("SELECT v FROM settings WHERE k='catalog_seeded'")).fetchone()
         defaults = {
             "uah_per_usd": "0",  # 0 disables UAH payments until the admin sets a rate.
             "ton_usd": "0",      # 0 disables TON payments until the admin sets a rate.
@@ -367,49 +352,74 @@ async def init_db():
         for key, value in defaults.items():
             await c.execute("INSERT OR IGNORE INTO settings(k,v) VALUES(?,?)", (key, value))
 
-        # Сверяем каталог со списком: существующие товары обновляем на месте,
-        # чтобы сохранить связанные складские позиции и историю заказов.
-        existing = await (await c.execute(
-            "SELECT id, title FROM products WHERE cat_id=?", (tg_cat_id,)
-        )).fetchall()
-        existing_by_key = {}
-        for row in existing:
-            existing_by_key.setdefault(country_product_key(row[1]), row)
+        if not catalog_done:
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('catalog_seeded','1')")
+            if not had_existing_store:
+                n = await (await c.execute("SELECT COUNT(*) FROM categories")).fetchone()
+                if n[0] == 0:
+                    await c.executemany("INSERT INTO categories(name) VALUES(?)", [("📧 Gmail",), ("🎮 Discord",)])
 
-        # Старое общее название Виргинских островов сопоставляется с первой позицией.
-        country_ids = []
-        active_target_ids = set()
-        for title, price, plain_name in TELEGRAM_COUNTRY_PRODUCTS:
-            key = country_product_key(title)
-            old = existing_by_key.get(key)
-            if old is not None:
-                product_id = int(old[0])
+                # Нормализуем название категории, в том числе в существующей базе.
+                await c.execute("UPDATE categories SET name='📱 Telegram аккаунты' WHERE name IN ('📱 Telegram акаунти','Telegram акаунти')")
+                catrow = await (await c.execute(
+                    "SELECT id FROM categories WHERE lower(name) LIKE '%telegram%' OR lower(name) LIKE '%телеграм%' LIMIT 1"
+                )).fetchone()
+                if not catrow:
+                    cur = await c.execute("INSERT INTO categories(name) VALUES(?)", ("📱 Telegram аккаунты",))
+                    tg_cat_id = cur.lastrowid
+                else:
+                    tg_cat_id = int(catrow[0])
+
+                # Каталоги VK и TikTok — как Gmail и Discord (создаются, если их ещё нет).
+                have = {acc_platform(r_[0]) for r_ in await (await c.execute("SELECT name FROM categories")).fetchall()}
+                for key_, name_ in (("vk", "💙 VK"), ("tiktok", "🎵 TikTok")):
+                    if key_ not in have:
+                        await c.execute("INSERT INTO categories(name) VALUES(?)", (name_,))
+
+
+                # Сверяем каталог со списком: существующие товары обновляем на месте,
+                # чтобы сохранить связанные складские позиции и историю заказов.
+                existing = await (await c.execute(
+                    "SELECT id, title FROM products WHERE cat_id=?", (tg_cat_id,)
+                )).fetchall()
+                existing_by_key = {}
+                for row in existing:
+                    existing_by_key.setdefault(country_product_key(row[1]), row)
+
+                # Старое общее название Виргинских островов сопоставляется с первой позицией.
+                country_ids = []
+                active_target_ids = set()
+                for title, price, plain_name in TELEGRAM_COUNTRY_PRODUCTS:
+                    key = country_product_key(title)
+                    old = existing_by_key.get(key)
+                    if old is not None:
+                        product_id = int(old[0])
+                        await c.execute(
+                            "UPDATE products SET cat_id=?, title=?, price=?, active=1 WHERE id=?",
+                            (tg_cat_id, title, price, product_id),
+                        )
+                    else:
+                        cur = await c.execute(
+                            "INSERT INTO products(cat_id,title,price,active) VALUES(?,?,?,1)",
+                            (tg_cat_id, title, price),
+                        )
+                        product_id = int(cur.lastrowid)
+                    country_ids.append(product_id)
+                    active_target_ids.add(product_id)
+
+                # Старые страны, которых нет в новом прайсе, скрываем, но не удаляем:
+                # это сохраняет историю заказов и складские данные для администратора.
+                for row in existing:
+                    old_id = int(row[0])
+                    if old_id not in active_target_ids:
+                        await c.execute("UPDATE products SET active=0 WHERE id=?", (old_id,))
+
+                # Этот список также используется при миграции валюты, чтобы цены стран
+                # не пересчитывались как старые пользовательские цены. Сохраняем порядок прайса.
                 await c.execute(
-                    "UPDATE products SET cat_id=?, title=?, price=?, active=1 WHERE id=?",
-                    (tg_cat_id, title, price, product_id),
+                    "INSERT OR REPLACE INTO settings(k,v) VALUES('telegram_seed_product_ids',?)",
+                    (",".join(map(str, country_ids)),),
                 )
-            else:
-                cur = await c.execute(
-                    "INSERT INTO products(cat_id,title,price,active) VALUES(?,?,?,1)",
-                    (tg_cat_id, title, price),
-                )
-                product_id = int(cur.lastrowid)
-            country_ids.append(product_id)
-            active_target_ids.add(product_id)
-
-        # Старые страны, которых нет в новом прайсе, скрываем, но не удаляем:
-        # это сохраняет историю заказов и складские данные для администратора.
-        for row in existing:
-            old_id = int(row[0])
-            if old_id not in active_target_ids:
-                await c.execute("UPDATE products SET active=0 WHERE id=?", (old_id,))
-
-        # Этот список также используется при миграции валюты, чтобы цены стран
-        # не пересчитывались как старые пользовательские цены. Сохраняем порядок прайса.
-        await c.execute(
-            "INSERT OR REPLACE INTO settings(k,v) VALUES('telegram_seed_product_ids',?)",
-            (",".join(map(str, country_ids)),),
-        )
         await c.commit()
 
 
@@ -609,9 +619,9 @@ DT = {
     "order_wait": ("Заявка отправлена админу", "{id}",
                    "⏳ Заявку по замовленню №{id} надіслано. Очікуйте — адміністратор скоро відповість.",
                    "⏳ Заявка по заказу №{id} отправлена. Ожидайте — администратор скоро ответит."),
-    "order_next": ("Этап выдан, дальше кнопка", "{id}",
+    "order_next": ("Этап выдан, дальше кнопка", "{id} {data}",
                    TXT_ORDER_NEXT, TXT_ORDER_NEXT),
-    "order_done": ("Заказ выполнен", "{id}",
+    "order_done": ("Заказ выполнен", "{id} {data}",
                    "🎉 Замовлення №{id} виконано. Дякуємо за покупку!",
                    "🎉 Заказ №{id} выполнен. Спасибо за покупку!"),
     "order_refund": ("Возврат средств", "{id} {total}",
@@ -686,7 +696,7 @@ DT = {
                    "━━━━━━━━━━━━━━━━━━\n\n"
                    "📱 Информация по заказу показана выше. Выберите действие на кнопках ниже.\n"
                    "Если возникла проблема с заказом, обратитесь в поддержку."),
-    "code_sent": ("Ответ по заказу отправлен", "{id}",
+    "code_sent": ("Ответ по заказу отправлен", "{id} {data}",
                   "📩 Ответ по заказу №{id} отправлен выше.\n\n"
                   "Если возникла проблема или данные не подходят, обратитесь в поддержку.",
                   "📩 Ответ по заказу №{id} отправлен выше.\n\n"
@@ -913,11 +923,11 @@ async def sync_country_order_ui():
         "order_code": DT["order_code"][3],
         "code_sent": DT["code_sent"][3],
     }
-    for key, body in fixed_texts.items():
+    for key, body in fixed_texts.items():  # только если текста ещё нет: правки из админки не затираем
         await q("INSERT INTO ui_text(key,lang,html) VALUES(?,?,?) "
-                "ON CONFLICT(key,lang) DO UPDATE SET html=excluded.html", (key, "ru", body))
+                "ON CONFLICT(key,lang) DO NOTHING", (key, "ru", body))
     await q("INSERT INTO ui_btn(key,lang,label,emoji_id) VALUES(?,?,?,NULL) "
-            "ON CONFLICT(key,lang) DO UPDATE SET label=excluded.label, emoji_id=NULL",
+            "ON CONFLICT(key,lang) DO NOTHING",
             ("req_code", "ru", "📩 Получить код"))
 
     # В уже настроенных этапах заказа приводим подписи к русскому языку.
@@ -1104,11 +1114,10 @@ async def present(ev, text, markup=None, mt=None, mf=None):
                 sm = strip_icons(markup)
                 for t, mk in [(text, markup), (text, sm), (strip_tgemoji(text), sm)]:
                     try:
-                        await msg.edit_text(t, reply_markup=mk)
-                        return
+                        return await msg.edit_text(t, reply_markup=mk)
                     except TelegramBadRequest as e:
                         if "not modified" in str(e):
-                            return
+                            return msg
             try:
                 await msg.delete()
             except Exception:
@@ -1118,20 +1127,61 @@ async def present(ev, text, markup=None, mt=None, mf=None):
             chat = ev.from_user.id
     else:
         chat = ev.chat.id
-    await try_send(bot, chat, text, markup, mt, mf)
+    return await try_send(bot, chat, text, markup, mt, mf)
 
 
 show = present  # админские экраны (без медиа)
 
 
-async def screen(ev, key, L, markup=None, media=None, **kw):
+async def screen(ev, key, L, markup=None, media=None, override=None, **kw):
     mt, mf = media if (media and media[0]) else text_media(L, key)
-    await present(ev, fill(txt(L, key), **kw), markup, mt, mf)
+    return await present(ev, fill(override or txt(L, key), **kw), markup, mt, mf)
 
 
-async def screen_to(bot, uid, key, L, markup=None, **kw):
+async def screen_to(bot, uid, key, L, markup=None, override=None, **kw):
     mt, mf = text_media(L, key)
-    await try_send(bot, uid, fill(txt(L, key), **kw), markup, mt, mf)
+    await try_send(bot, uid, fill(override or txt(L, key), **kw), markup, mt, mf)
+
+
+async def drop_wait_message(bot, o):
+    """Убирает устаревшее сообщение «Ожидайте», когда заказ выдан."""
+    wid = o["wait_msg_id"]
+    if wid:
+        try:
+            await bot.delete_message(o["user_id"], wid)
+        except Exception:
+            pass
+
+
+async def deliver_result(bot, o, m, key, L, markup, override=None, **kw):
+    """Выдача одним красивым сообщением: если в тексте есть {data} и админ прислал текст,
+    сообщение «Ожидайте» превращается в результат. False — шаблона нет, нужен старый путь."""
+    tpl = override or txt(L, key)
+    if not (m.text and "{data}" in tpl):
+        return False
+    mt, mf = text_media(L, key)
+    body = fill(tpl, data=html.escape(m.text), **kw)
+    wid = o["wait_msg_id"]
+    if wid and not mt:
+        sm = strip_icons(markup)
+        for t, mk in [(body, markup), (body, sm), (strip_tgemoji(body), sm)]:
+            try:
+                await bot.edit_message_text(t, chat_id=o["user_id"], message_id=wid, reply_markup=mk)
+                return True
+            except TelegramBadRequest as e:
+                if "not modified" in str(e):
+                    return True
+    await drop_wait_message(bot, o)
+    await try_send(bot, o["user_id"], body, markup, mt, mf)
+    return True
+
+
+async def product_override(pid, field):
+    """Свой текст товара (после оплаты / следующий шаг). None → используется общий текст."""
+    if field not in ("paid_text", "next_text", "wait_text") or pid is None:
+        return None
+    row = await q(f"SELECT {field} FROM products WHERE id=?", (pid,), "one")
+    return (row[field] or None) if row else None
 
 
 async def lang_of(uid):
@@ -1850,7 +1900,8 @@ async def _do_buy(c: CallbackQuery):
         return await c.answer(alert_text(L, key), show_alert=True)
     if status == "manual":
         oid, total, title, steps = res
-        return await screen(c, "order_paid", L, order_kb(L, oid, steps, 0), id=oid,
+        return await screen(c, "order_paid", L, order_kb(L, oid, steps, 0),
+                            override=await product_override(int(pid), "paid_text"), id=oid,
                             title=html.escape(title), qty=qty, total=money(total))
     oid, total, title, rows = res
     items = "\n\n".join(fmt_item(L, x) for x in rows)
@@ -1913,7 +1964,10 @@ async def o_req(c: CallbackQuery, bot: Bot):
             await bot.send_message(sid, text, reply_markup=mk)
         except Exception:
             pass
-    await screen(c, "order_wait", L, kb([support_row(L)]) if support_row(L) else None, id=oid)
+    sent = await screen(c, "order_wait", L, kb([support_row(L)]) if support_row(L) else None,
+                        override=await product_override(o["product_id"], "wait_text"), id=oid)
+    if sent is not None and hasattr(sent, "message_id"):
+        await q("UPDATE orders SET wait_msg_id=? WHERE id=?", (sent.message_id, oid))
 
 
 @r.callback_query(F.data.startswith("o:fin:"))
@@ -1934,11 +1988,16 @@ async def hist_item(c: CallbackQuery):
         return await c.answer()
     if o["status"] == "active":
         if o["pending"]:
-            return await screen(c, "order_wait", L, kb([support_row(L)]) if support_row(L) else None, id=o["id"])
+            sent = await screen(c, "order_wait", L, kb([support_row(L)]) if support_row(L) else None,
+                                override=await product_override(o["product_id"], "wait_text"), id=o["id"])
+            if sent is not None and hasattr(sent, "message_id"):
+                await q("UPDATE orders SET wait_msg_id=? WHERE id=?", (sent.message_id, o["id"]))
+            return
         if o["kind"] == "code":
             return await screen(c, "code_sent", L, code_kb(L, o["id"]), id=o["id"])
         steps = json.loads(o["steps"] or "[]")
-        return await screen(c, "order_next", L, order_kb(L, o["id"], steps, o["step"]), id=o["id"])
+        return await screen(c, "order_next", L, order_kb(L, o["id"], steps, o["step"]),
+                            override=await product_override(o["product_id"], "next_text"), id=o["id"])
     await c.message.answer_document(BufferedInputFile((o["items"] or "—").encode(), f"order_{o['id']}.txt"))
     await c.answer()
 
@@ -1975,7 +2034,7 @@ async def dep_hist(c: CallbackQuery):
     for d in ds:
         original = f"{float(d['paid_amount']):.2f} {d['currency']} → " if d['paid_amount'] is not None else ""
         lines.append((d["created"] or "", f"{icon.get(d['status'], '•')} Банк №{d['id']} — {original}{money(d['amount'])} — {d['created']}"))
-    method_name = {"cryptobot": "Crypto Bot", "ton": "TON Keeper"}
+    method_name = {"cryptobot": "Crypto Bot", "xrocket": "xRocket", "ton": "TON Keeper"}
     for item in ps:
         lines.append((item["created"] or "", f"{icon.get(item['status'], '•')} {method_name.get(item['method'], item['method'])} №{item['id']} — {money(item['usd_amount'])} — {item['status']}"))
     lines.sort(key=lambda x: x[0], reverse=True)
@@ -1999,6 +2058,7 @@ class Topup(StatesGroup):
     amount = State()
     receipt = State()
     crypto_amount = State()
+    xrocket_amount = State()
     ton_amount = State()
 
 
@@ -2047,6 +2107,55 @@ async def create_crypto_intent(uid, usd_amount):
     except Exception:
         await q("UPDATE payment_intents SET status='failed' WHERE id=? AND status='creating'", (pid,))
         logging.exception("Could not create Crypto Pay invoice (intent %s)", pid)
+        raise
+
+
+async def xrocket_api(method, path, payload=None, token=None):
+    """xRocket Pay API wrapper (https://pay.xrocket.tg). Token is never logged or shown to users."""
+    token = token or SET.get("xrocket_token", "")
+    if not token:
+        raise RuntimeError("xRocket API token is not configured")
+    timeout = aiohttp.ClientTimeout(total=20)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(
+            method,
+            f"{XROCKET_API_URL}{path}",
+            json=payload,
+            headers={"Rocket-Pay-Key": token, "Content-Type": "application/json"},
+        ) as resp:
+            data = await resp.json(content_type=None)
+            if resp.status >= 400 or not isinstance(data, dict) or not data.get("success"):
+                raise RuntimeError(f"xRocket API error ({resp.status})")
+            return data.get("data")
+
+
+async def create_xrocket_intent(uid, usd_amount):
+    pid = await q(
+        "INSERT INTO payment_intents(user_id,method,usd_amount,expected_amount,asset,status,created) "
+        "VALUES(?,?,?,?,?,'creating',?)",
+        (uid, "xrocket", usd_amount, usd_amount, "USDT", now()),
+    )
+    payload = f"vh:{pid}:{uid}"
+    try:
+        invoice = await xrocket_api("POST", "/tg-invoices", {
+            "amount": round(float(usd_amount), 2),
+            "numPayments": 1,
+            "currency": "USDT",
+            "description": f"{SHOP} balance top-up #{pid}",
+            "payload": payload,
+            "commentsEnabled": False,
+            "expiredIn": 3600,
+        })
+        invoice_id = str(invoice["id"])
+        pay_url = invoice.get("link")
+        if not pay_url:
+            raise RuntimeError("xRocket API returned no invoice link")
+        await q("UPDATE payment_intents SET external_id=?,pay_url=?,payload=?,status='pending' WHERE id=?",
+                (invoice_id, pay_url, payload, pid))
+        return pid, pay_url
+    except Exception:
+        await q("UPDATE payment_intents SET status='failed' WHERE id=? AND status='creating'", (pid,))
+        logging.exception("Could not create xRocket invoice (intent %s)", pid)
         raise
 
 
@@ -2122,10 +2231,7 @@ async def crypto_pending(bot, only_id=None):
     except Exception:
         logging.warning("Crypto Pay invoice check temporarily failed", exc_info=True)
         return
-    # Crypto Pay API повертає {"items": [...]} (старі версії — просто список)
-    if isinstance(invoices, dict):
-        invoices = invoices.get("items") or []
-    by_id = {str(x.get("invoice_id")): x for x in (invoices or []) if isinstance(x, dict)}
+    by_id = {str(x.get("invoice_id")): x for x in (invoices or [])}
     for item in pending:
         inv = by_id.get(str(item["external_id"]))
         if not inv:
@@ -2135,6 +2241,41 @@ async def crypto_pending(bot, only_id=None):
             await settle_payment_intent(item["id"], f"cryptobot:{item['external_id']}", bot)
         elif status == "expired":
             await q("UPDATE payment_intents SET status='expired' WHERE id=? AND status='pending'", (item["id"],))
+
+
+async def xrocket_pending(bot, only_id=None):
+    token = (SET.get("xrocket_token") or "").strip()
+    if not token:
+        return
+    sql = "SELECT * FROM payment_intents WHERE method='xrocket' AND status='pending' AND external_id IS NOT NULL"
+    args = ()
+    if only_id is not None:
+        sql += " AND id=?"
+        args = (only_id,)
+    pending = await q(sql + " ORDER BY id LIMIT 50", args, "all")
+    for item in pending:
+        try:
+            inv = await xrocket_api("GET", f"/tg-invoices/{item['external_id']}", token=token)
+        except Exception:
+            logging.warning("xRocket invoice check temporarily failed (intent %s)", item["id"], exc_info=True)
+            continue
+        if not isinstance(inv, dict):
+            continue
+        status = inv.get("status")
+        if status == "paid":
+            # защита: сумма и валюта счёта должны совпадать с тем, что мы создавали
+            try:
+                if inv.get("currency") and str(inv["currency"]).upper() != "USDT":
+                    raise ValueError("currency mismatch")
+                if inv.get("amount") is not None and abs(float(inv["amount"]) - float(item["usd_amount"])) > 0.011:
+                    raise ValueError("amount mismatch")
+            except ValueError:
+                logging.error("xRocket invoice %s does not match intent %s; not credited", item["external_id"], item["id"])
+                continue
+            await settle_payment_intent(item["id"], f"xrocket:{item['external_id']}", bot)
+        elif status == "expired":
+            await q("UPDATE payment_intents SET status='expired' WHERE id=? AND status='pending'", (item["id"],))
+        await asyncio.sleep(0.2)
 
 
 def ton_message_text(in_msg):
@@ -2211,6 +2352,10 @@ async def payment_watchdog(bot):
         except Exception:
             logging.exception("Crypto payment worker iteration failed")
         try:
+            await xrocket_pending(bot)
+        except Exception:
+            logging.exception("xRocket payment worker iteration failed")
+        try:
             await ton_pending(bot)
         except Exception:
             logging.exception("TON payment worker iteration failed")
@@ -2226,6 +2371,8 @@ async def tp_start(c: CallbackQuery, state: FSMContext):
     ton_rate = parse_num(SET.get("ton_usd"), 0.000001, 1_000_000_000)
     if SET.get("cryptobot_token"):
         rows.append([btn("🤖 Crypto Bot · USDT", "tp:crypto")])
+    if SET.get("xrocket_token"):
+        rows.append([btn("🚀 xRocket · USDT", "tp:xrocket")])
     if SET.get("ton_wallet") and SET.get("toncenter_api_key") and ton_rate:
         rows.append([btn("💎 TON Keeper · TON", "tp:ton")])
     if reqs and uah_rate:
@@ -2319,6 +2466,35 @@ async def tp_crypto_amount(m: Message, state: FSMContext):
     )
 
 
+@r.callback_query(F.data == "tp:xrocket")
+async def tp_xrocket(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not SET.get("xrocket_token"):
+        return await c.answer("xRocket не настроен администратором.", show_alert=True)
+    await state.set_state(Topup.xrocket_amount)
+    await show(c, f"Введите сумму пополнения в USD (минимум {money(MIN_TOPUP_USD)}). Оплата будет через xRocket в USDT.",
+               kb([[B(await lang_of(c.from_user.id), "cancel", "tp:start")]]))
+
+
+@r.message(Topup.xrocket_amount)
+async def tp_xrocket_amount(m: Message, state: FSMContext):
+    usd = parse_amount(m.text, MIN_TOPUP_USD)
+    if usd is None:
+        return await m.answer(f"Введите сумму в USD не меньше {money(MIN_TOPUP_USD)}.")
+    await state.clear()
+    try:
+        pid, pay_url = await create_xrocket_intent(m.from_user.id, usd)
+    except Exception:
+        return await m.answer("Не удалось создать счёт xRocket. Попробуйте позже или выберите другой способ оплаты.",
+                              reply_markup=kb([[btn("⬅️ К балансу", "m:bal")]]))
+    await m.answer(
+        f"🚀 <b>Счёт xRocket №{pid}</b>\n\nК оплате: <b>{money(usd)} USDT</b>\n"
+        "После успешной оплаты баланс будет автоматически зачислен в USD. Счёт действует 60 минут.",
+        reply_markup=kb([[btn("🚀 Оплатить в xRocket", url=pay_url)], [btn("🔄 Проверить оплату", f"tp:check:{pid}")],
+                         [btn("⬅️ К балансу", "m:bal")]])
+    )
+
+
 @r.callback_query(F.data == "tp:ton")
 async def tp_ton(c: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -2357,13 +2533,12 @@ async def tp_check(c: CallbackQuery, bot: Bot):
     if not item:
         return await c.answer("Платіж не знайдено.", show_alert=True)
     if item["status"] == "pending":
-        try:
-            if item["method"] == "cryptobot":
-                await crypto_pending(bot, pid)
-            elif item["method"] == "ton":
-                await ton_pending(bot, pid)
-        except Exception:
-            logging.exception("Manual payment check failed (intent %s)", pid)
+        if item["method"] == "cryptobot":
+            await crypto_pending(bot, pid)
+        elif item["method"] == "xrocket":
+            await xrocket_pending(bot, pid)
+        elif item["method"] == "ton":
+            await ton_pending(bot, pid)
         item = await q("SELECT * FROM payment_intents WHERE id=?", (pid,), "one")
     if item["status"] == "paid":
         return await c.answer(f"Оплату підтверджено: {money(item['usd_amount'])} зараховано.", show_alert=True)
@@ -2561,29 +2736,39 @@ async def fulfill_in(m: Message, state: FSMContext, bot: Bot):
         await state.clear()
         return await m.answer("Заявка уже закрыта.", reply_markup=back_admin())
     L = await lang_of(o["user_id"])
+    is_code = o["kind"] == "code"
+    steps = json.loads(o["steps"] or "[]")
+    if is_code:
+        key, markup, override = "code_sent", code_kb(L, oid), None
+    else:
+        nxt = o["step"] + 1
+        done = nxt >= len(steps)
+        key = "order_done" if done else "order_next"
+        markup = (kb([support_row(L)]) if support_row(L) else None) if done else order_kb(L, oid, steps, nxt)
+        override = None if done else await product_override(o["product_id"], "next_text")
     try:
-        await bot.copy_message(o["user_id"], m.chat.id, m.message_id)
+        sent = await deliver_result(bot, o, m, key, L, markup, override, id=oid)
+        if not sent:
+            await bot.copy_message(o["user_id"], m.chat.id, m.message_id)
     except Exception as e:
         return await m.answer(f"❌ Не удалось отправить покупателю: {e}")
-    if o["kind"] == "code":  # код отправлен; заказ остаётся открытым для повторного запроса
+    if is_code:  # код отправлен; заказ остаётся открытым для повторного запроса
         items = (o["items"] or "") + "\n" + f"Код: {m.text or m.caption or '[файл]'}"
         await q("UPDATE orders SET pending=0, claimed_by=NULL, items=? WHERE id=?", (items, oid))
         await state.clear()
-        await screen_to(bot, o["user_id"], "code_sent", L, code_kb(L, oid), id=oid)
+        if not sent:
+            await drop_wait_message(bot, o)
+            await screen_to(bot, o["user_id"], key, L, markup, id=oid)
         return await m.answer("✅ Код отправлен покупателю. Повторно он сможет запросить через 2 минуты.",
                               reply_markup=back_admin())
-    steps = json.loads(o["steps"] or "[]")
-    nxt = o["step"] + 1
     note = f"{steps[o['step']][0]}: {m.text or m.caption or '[файл]'}"
     items = ((o["items"] + "\n") if o["items"] else "") + note
-    done = nxt >= len(steps)
     await q("UPDATE orders SET step=?, pending=0, claimed_by=NULL, items=?, status=? WHERE id=?",
             (nxt, items, "done" if done else "active", oid))
     await state.clear()
-    if done:
-        await screen_to(bot, o["user_id"], "order_done", L, kb([support_row(L)]) if support_row(L) else None, id=oid)
-    else:
-        await screen_to(bot, o["user_id"], "order_next", L, order_kb(L, oid, steps, nxt), id=oid)
+    if not sent:
+        await drop_wait_message(bot, o)
+        await screen_to(bot, o["user_id"], key, L, markup, override=override, id=oid)
     await m.answer("✅ Отправлено покупателю" + (" — заказ завершён." if done else
                    ". Покупатель получил кнопку следующего этапа."), reply_markup=back_admin())
 
@@ -2671,11 +2856,16 @@ async def a_prod(c: CallbackQuery, state: FSMContext):
                  [btn("📱 Редактировать номера на складе", f"a:stocks:{pid}:0")],
                  [btn("📝 Описание", f"f:pd:{pid}"), btn("🖼 Медиа", f"f:pm:{pid}"), btn("🗑 Медиа", f"f:pmd:{pid}")],
                  [btn("🔁 Этапы выдачи", f"f:ps:{pid}"), btn("📦 Автовыдача", f"f:psc:{pid}")],
+                 [btn("💬 Текст после оплаты", f"f:ppt:{pid}"), btn("💬 Текст след. шага", f"f:pnt:{pid}")],
+                 [btn("💬 Текст «Ожидайте»", f"f:pwt:{pid}")],
                  [btn("🧹 Очистить склад", f"f:stc:{pid}"), btn("🗑 Удалить товар", f"f:delp:{pid}")]]
     rows.append([btn("⬅️ Назад", f"a:cat:{p['cat_id']}")])
     shown_n = p["stock_qty"] if is_manual(p) and p["stock_qty"] >= 0 else n
     await show(c, f"<b>{html.escape(p['title'])}</b>\nЦена за единицу: {money(p['price'])}\nНа складе: {shown_n}\n{mode}\n"
-                  f"Медиа: {p['mtype'] or 'нет'}", kb(rows))
+                  f"Медиа: {p['mtype'] or 'нет'}\n"
+                  f"💬 Свой текст после оплаты: {'✅' if p['paid_text'] else 'общий'} • "
+                  f"след. шага: {'✅' if p['next_text'] else 'общий'} • "
+                  f"«Ожидайте»: {'✅' if p['wait_text'] else 'общий'}", kb(rows))
 
 
 class StockStep(StatesGroup):
@@ -2948,6 +3138,12 @@ async def edit_input(m: Message, state: FSMContext):
             return await m.answer("Отправьте фото, GIF или видео.")
         tbl = "categories" if kind == "cat_media" else "products"
         await q(f"UPDATE {tbl} SET mtype=?, mfile=? WHERE id=?", (med[0], med[1], d["id"]))
+    elif kind in ("prod_paid_text", "prod_next_text", "prod_wait_text"):
+        if not m.text:
+            return await m.answer("Нужно текстовое сообщение (или «-», чтобы вернуть общий текст).")
+        col = {"prod_paid_text": "paid_text", "prod_next_text": "next_text", "prod_wait_text": "wait_text"}[kind]
+        val = None if m.text.strip() == "-" else m.html_text
+        await q(f"UPDATE products SET {col}=? WHERE id=?", (val, d["id"]))
     elif kind == "prod_desc":
         if not m.text:
             return await m.answer("Нужен текст.")
@@ -3022,6 +3218,15 @@ async def edit_input(m: Message, state: FSMContext):
         if not re.fullmatch(r"[0-9]+:[A-Za-z0-9_-]{10,}", token):
             return await m.answer("Формат токена не похож на Crypto Pay API token. Настройка не изменена.")
         await set_setting("cryptobot_token", token)
+    elif kind == "xrocket_token":
+        token = (m.text or "").strip()
+        try:
+            await m.delete()
+        except Exception:
+            pass
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{16,200}", token):
+            return await m.answer("Формат токена не похож на xRocket Pay API token. Настройка не изменена.")
+        await set_setting("xrocket_token", token)
     elif kind == "toncenter_api_key":
         api_key = (m.text or "").strip()
         try:
@@ -3176,6 +3381,41 @@ async def f_pd(c, state):
     pid = c.data.split(":")[2]
     await start_edit(c, state, "prod_desc", "Описание товара (оно появится в карточке):" + FMT_HINT,
                      f"a:p:{pid}", id=int(pid))
+
+
+PROD_TEXT_HINT = ("\n\nПеременные: <code>{id}</code> — номер заказа, <code>{title}</code> — название, "
+                  "<code>{qty}</code> — количество, <code>{total}</code> — сумма.\n"
+                  "Отправьте <code>-</code>, чтобы вернуть общий текст для всех товаров.")
+
+
+@r.callback_query(F.data.startswith("f:ppt:"), Full())
+async def f_ppt(c, state):
+    pid = int(c.data.split(":")[2])
+    await start_edit(c, state, "prod_paid_text",
+                     "💬 Текст, который покупатель увидит <b>сразу после оплаты</b> этого товара "
+                     "(под ним будет первая кнопка этапа, например «Получить токен»):" + PROD_TEXT_HINT + FMT_HINT,
+                     f"a:p:{pid}", id=pid)
+
+
+@r.callback_query(F.data.startswith("f:pnt:"), Full())
+async def f_pnt(c, state):
+    pid = int(c.data.split(":")[2])
+    await start_edit(c, state, "prod_next_text",
+                     "💬 Текст, который покупатель увидит <b>после того, как вы выдали этап</b> (номер/токен/пароль) "
+                     "этого товара. Под ним будет кнопка следующего этапа:" + PROD_TEXT_HINT + FMT_HINT,
+                     f"a:p:{pid}", id=pid)
+
+
+@r.callback_query(F.data.startswith("f:pwt:"), Full())
+async def f_pwt(c, state):
+    pid = int(c.data.split(":")[2])
+    await start_edit(c, state, "prod_wait_text",
+                     "💬 Текст, который покупатель увидит после нажатия кнопки этапа "
+                     "(например, «Получить токен»), пока заявка ждёт вас. Сейчас по умолчанию там: "
+                     "«Заявка по заказу №... отправлена. Ожидайте — администратор скоро ответит.»"
+                     "\n\nПеременная: <code>{id}</code> — номер заказа.\n"
+                     "Отправьте <code>-</code>, чтобы вернуть общий текст." + FMT_HINT,
+                     f"a:p:{pid}", id=pid)
 
 
 @r.callback_query(F.data.startswith("f:pm:"), Full())
@@ -3424,6 +3664,7 @@ async def f_br(c: CallbackQuery):
 async def f_payments(c: CallbackQuery, state: FSMContext):
     await state.clear()
     token_ok = bool(SET.get("cryptobot_token"))
+    xr_ok = bool(SET.get("xrocket_token"))
     wallet = (SET.get("ton_wallet") or "").strip()
     key_ok = bool(SET.get("toncenter_api_key"))
     uah_rate = parse_num(SET.get("uah_per_usd"), 0.01, 1_000_000)
@@ -3432,6 +3673,7 @@ async def f_payments(c: CallbackQuery, state: FSMContext):
     text = (
         "💳 <b>Платежі та курси</b>\n\n"
         f"🤖 Crypto Bot API: {'налаштовано ✅' if token_ok else 'не налаштовано ⛔'}\n"
+        f"🚀 xRocket API: {'налаштовано ✅' if xr_ok else 'не налаштовано ⛔'}\n"
         f"💎 TON Keeper-адреса: {html.escape(wallet) if wallet else 'не задана'}\n"
         f"🔑 TON Center API key: {'налаштовано ✅' if key_ok else 'не налаштовано ⛔'}\n\n"
         f"💱 UAH/USD: {'1 USD = ' + format(uah_rate, '.4f') + ' UAH' if uah_rate else 'не задано (оплата UAH отключена)'}\n"
@@ -3440,11 +3682,13 @@ async def f_payments(c: CallbackQuery, state: FSMContext):
     )
     rows = [
         [btn("🔐 Встановити Crypto Bot API token", "f:pay:edit:cryptobot_token")],
+        [btn("🚀 Встановити xRocket API token", "f:pay:edit:xrocket_token")],
         [btn("💎 Встановити TON Keeper-адресу", "f:pay:edit:ton_wallet")],
         [btn("🔑 Встановити TON Center API key", "f:pay:edit:toncenter_api_key")],
         [btn("💱 Курс UAH за 1 USD", "f:pay:edit:uah_per_usd"),
          btn("💎 Курс USD за 1 TON", "f:pay:edit:ton_usd")],
-        [btn("🧪 Перевірити Crypto Bot", "f:pay:testcrypto"), btn("🧪 Перевірити TON Center", "f:pay:testton")],
+        [btn("🧪 Перевірити Crypto Bot", "f:pay:testcrypto"), btn("🧪 Перевірити xRocket", "f:pay:testxrocket")],
+        [btn("🧪 Перевірити TON Center", "f:pay:testton")],
     ]
     if legacy_pending:
         rows.append([btn("🔄 Конвертувати старі UAH-суми в USD", "f:pay:migrate")])
@@ -3457,6 +3701,7 @@ async def f_pay_edit(c: CallbackQuery, state: FSMContext):
     kind = c.data.split(":", 3)[3]
     prompts = {
         "cryptobot_token": "Надішліть Crypto Pay API token від @CryptoBot. Сообщение будет удалено после получения.",
+        "xrocket_token": "Отправьте API-токен xRocket Pay (бот @xrocket → Rocket Pay → Create App → API token). Сообщение будет удалено после получения.",
         "ton_wallet": "Отправьте адрес TON-кошелька, на который покупатели должны переводить TON.",
         "toncenter_api_key": "Отправьте TON Center API key. Сообщение будет удалено после получения.",
         "uah_per_usd": "Вкажіть, скільки гривень коштує 1 USD (наприклад, 41.50). Це курс для банківського поповнення.",
@@ -3478,6 +3723,19 @@ async def f_pay_test_crypto(c: CallbackQuery):
     except Exception:
         logging.warning("Crypto Pay credentials test failed", exc_info=True)
         await c.answer("Перевірка не пройшла. Перевірте токен та доступ до API.", show_alert=True)
+
+
+@r.callback_query(F.data == "f:pay:testxrocket", Full())
+async def f_pay_test_xrocket(c: CallbackQuery):
+    if not SET.get("xrocket_token"):
+        return await c.answer("Токен не задан.", show_alert=True)
+    try:
+        info = await xrocket_api("GET", "/app/info")
+        name = html.escape(str((info or {}).get("name") or "xRocket app"))
+        await c.answer(f"API отвечает: {name}", show_alert=True)
+    except Exception:
+        logging.warning("xRocket credentials test failed", exc_info=True)
+        await c.answer("Проверка не прошла. Проверьте токен и доступ к API.", show_alert=True)
 
 
 @r.callback_query(F.data == "f:pay:testton", Full())
