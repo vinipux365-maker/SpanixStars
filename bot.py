@@ -18,6 +18,7 @@ import re
 import time
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 
 import aiosqlite
 import aiohttp
@@ -30,18 +31,31 @@ from aiogram.filters import Command, CommandStart, Filter, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (BufferedInputFile, CallbackQuery,
+from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile,
                            InlineKeyboardButton, InlineKeyboardMarkup, Message)
 from dotenv import load_dotenv
 
-load_dotenv()
-BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 OWNERS = {int(x) for x in os.getenv("OWNER_IDS", "").replace(" ", "").split(",") if x}
 CUR = "$"  # Все внутренние суммы и цены магазина отображаются только в USD.
 SUPPORT_ENV = os.getenv("SUPPORT_USERNAME", "").lstrip("@")
 MIN_TOPUP = float(os.getenv("MIN_TOPUP_UAH", os.getenv("MIN_TOPUP", "50")))  # Минимум для ручного пополнения в гривне.
 MIN_TOPUP_USD = float(os.getenv("MIN_TOPUP_USD", "1"))
-DB = os.getenv("DB_PATH", "vh.db")
+
+
+def resolve_db_path():
+    """Локальный SQLite. Относительный DB_PATH считается от папки проекта, не от cwd."""
+    raw = (os.getenv("DB_PATH") or "data/vh.db").strip() or "data/vh.db"
+    path = Path(raw)
+    if not path.is_absolute():
+        path = ROOT / path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+DB = resolve_db_path()
 XROCKET_API_URL = os.getenv("XROCKET_API_URL", "https://pay.xrocket.tg").rstrip("/")
 SHOP = "vh"
 
@@ -286,6 +300,21 @@ CREATE TABLE IF NOT EXISTS ui_btn(key TEXT, lang TEXT, label TEXT, emoji_id TEXT
 CREATE TABLE IF NOT EXISTS settings(k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS premium_plans(id INTEGER PRIMARY KEY AUTOINCREMENT, months INTEGER, price REAL,
   active INTEGER DEFAULT 1);
+CREATE TABLE IF NOT EXISTS fsms_workers(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, login TEXT NOT NULL UNIQUE, password TEXT NOT NULL, created TEXT);
+CREATE TABLE IF NOT EXISTS fsms_services(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, remote_id INTEGER NOT NULL UNIQUE, name TEXT NOT NULL,
+  base_price REAL NOT NULL, price REAL NOT NULL, cat_id INTEGER NOT NULL);
+CREATE TABLE IF NOT EXISTS fsms_orders(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, service_id INTEGER, service_name TEXT,
+  emoji_id TEXT, remote_id INTEGER, worker_id INTEGER, remote_sid TEXT, phone TEXT, code TEXT, price REAL,
+  status TEXT, issued_at REAL, wait_at REAL, msg_id INTEGER, created TEXT);
+CREATE TABLE IF NOT EXISTS fsms_refunds(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL UNIQUE, user_id INTEGER NOT NULL,
+  file_id TEXT, status TEXT NOT NULL, reason TEXT, fsms_sent INTEGER DEFAULT 0, created TEXT, decided_at TEXT);
+CREATE TABLE IF NOT EXISTS fsms_queue(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, service_id INTEGER NOT NULL,
+  msg_id INTEGER, created TEXT);
 """
 MIGRATIONS = [  # для баз, созданных старой версией
     "ALTER TABLE requisites ADD COLUMN emoji_id TEXT",
@@ -306,6 +335,9 @@ MIGRATIONS = [  # для баз, созданных старой версией
     "ALTER TABLE orders ADD COLUMN last_req INTEGER DEFAULT 0",
     "ALTER TABLE deposits ADD COLUMN currency TEXT DEFAULT 'UAH'",
     "ALTER TABLE deposits ADD COLUMN paid_amount REAL",
+    "ALTER TABLE fsms_orders ADD COLUMN wait_at REAL",
+    "ALTER TABLE fsms_services ADD COLUMN emoji_id TEXT",
+    "ALTER TABLE fsms_services ADD COLUMN emoji_char TEXT",
 ]
 
 
@@ -342,8 +374,7 @@ async def init_db():
             await c.executemany("INSERT INTO premium_plans(months,price) VALUES(?,?)", [(3, 16.0), (6, 21.0), (12, 35.0)])
             await c.execute("INSERT INTO settings(k,v) VALUES('plans_seeded','1')")
 
-        # Каталог (категории и страны Telegram) наполняется ОДИН раз — только в новой пустой базе.
-        # В существующей базе всё, что ты менял/удалял/добавлял, остаётся как есть.
+        # Готовые разделы и склад не создаются: каталоги добавляет администратор.
         catalog_done = await (await c.execute("SELECT v FROM settings WHERE k='catalog_seeded'")).fetchone()
         defaults = {
             "uah_per_usd": "0",  # 0 disables UAH payments until the admin sets a rate.
@@ -354,72 +385,17 @@ async def init_db():
 
         if not catalog_done:
             await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('catalog_seeded','1')")
-            if not had_existing_store:
-                n = await (await c.execute("SELECT COUNT(*) FROM categories")).fetchone()
-                if n[0] == 0:
-                    await c.executemany("INSERT INTO categories(name) VALUES(?)", [("📧 Gmail",), ("🎮 Discord",)])
-
-                # Нормализуем название категории, в том числе в существующей базе.
-                await c.execute("UPDATE categories SET name='📱 Telegram аккаунты' WHERE name IN ('📱 Telegram акаунти','Telegram акаунти')")
-                catrow = await (await c.execute(
-                    "SELECT id FROM categories WHERE lower(name) LIKE '%telegram%' OR lower(name) LIKE '%телеграм%' LIMIT 1"
-                )).fetchone()
-                if not catrow:
-                    cur = await c.execute("INSERT INTO categories(name) VALUES(?)", ("📱 Telegram аккаунты",))
-                    tg_cat_id = cur.lastrowid
-                else:
-                    tg_cat_id = int(catrow[0])
-
-                # Каталоги VK и TikTok — как Gmail и Discord (создаются, если их ещё нет).
-                have = {acc_platform(r_[0]) for r_ in await (await c.execute("SELECT name FROM categories")).fetchall()}
-                for key_, name_ in (("vk", "💙 VK"), ("tiktok", "🎵 TikTok")):
-                    if key_ not in have:
-                        await c.execute("INSERT INTO categories(name) VALUES(?)", (name_,))
-
-
-                # Сверяем каталог со списком: существующие товары обновляем на месте,
-                # чтобы сохранить связанные складские позиции и историю заказов.
-                existing = await (await c.execute(
-                    "SELECT id, title FROM products WHERE cat_id=?", (tg_cat_id,)
-                )).fetchall()
-                existing_by_key = {}
-                for row in existing:
-                    existing_by_key.setdefault(country_product_key(row[1]), row)
-
-                # Старое общее название Виргинских островов сопоставляется с первой позицией.
-                country_ids = []
-                active_target_ids = set()
-                for title, price, plain_name in TELEGRAM_COUNTRY_PRODUCTS:
-                    key = country_product_key(title)
-                    old = existing_by_key.get(key)
-                    if old is not None:
-                        product_id = int(old[0])
-                        await c.execute(
-                            "UPDATE products SET cat_id=?, title=?, price=?, active=1 WHERE id=?",
-                            (tg_cat_id, title, price, product_id),
-                        )
-                    else:
-                        cur = await c.execute(
-                            "INSERT INTO products(cat_id,title,price,active) VALUES(?,?,?,1)",
-                            (tg_cat_id, title, price),
-                        )
-                        product_id = int(cur.lastrowid)
-                    country_ids.append(product_id)
-                    active_target_ids.add(product_id)
-
-                # Старые страны, которых нет в новом прайсе, скрываем, но не удаляем:
-                # это сохраняет историю заказов и складские данные для администратора.
-                for row in existing:
-                    old_id = int(row[0])
-                    if old_id not in active_target_ids:
-                        await c.execute("UPDATE products SET active=0 WHERE id=?", (old_id,))
-
-                # Этот список также используется при миграции валюты, чтобы цены стран
-                # не пересчитывались как старые пользовательские цены. Сохраняем порядок прайса.
-                await c.execute(
-                    "INSERT OR REPLACE INTO settings(k,v) VALUES('telegram_seed_product_ids',?)",
-                    (",".join(map(str, country_ids)),),
-                )
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('stars_on','0')")
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('prem_on','0')")
+        cleared = await (await c.execute("SELECT v FROM settings WHERE k='catalogs_user_made'")).fetchone()
+        if not cleared:
+            await c.execute("DELETE FROM products")
+            await c.execute("DELETE FROM categories")
+            await c.execute("DELETE FROM fsms_services")
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('stars_on','0')")
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('prem_on','0')")
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('catalog_seeded','1')")
+            await c.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('catalogs_user_made','1')")
         await c.commit()
 
 
@@ -588,10 +564,10 @@ DT = {
                     "🌐 Выберите язык интерфейса",
                     "🌐 Выберите язык интерфейса"),
     "welcome": ("Главное меню", "—",
-                "👋 Добро пожаловать в <b>" + SHOP + " shop</b>!\n\n▪️ Аккаунты Gmail, Discord и Telegram\n▪️ Telegram Stars та Premium\n▪️ Баланс и цены в USD\n▪️ Автоматическое крипто-пополнение\n\nВыберите раздел:",
-                "👋 Приветствуем в <b>" + SHOP + " shop</b>!\n\n▪️ Аккаунты Gmail, Discord и Telegram\n▪️ Telegram Stars и Premium\n▪️ Баланс и цены в USD\n▪️ Крипто-пополнение\n\nВыберите раздел:"),
-    "shop_title": ("Витрина: список категорий", "—",
-                   "🛒 <b>Витрина товаров</b>\n\nВыберите категорию:", "🛒 <b>Витрина товаров</b>\n\nВыберите категорию:"),
+                "<b>Главное меню</b>\n\nВыберите раздел:",
+                "<b>Главное меню</b>\n\nВыберите раздел:"),
+    "shop_title": ("Витрина: список каталогов", "—",
+                   "🛒 <b>Витрина товаров</b>\n\nВыберите каталог:", "🛒 <b>Витрина товаров</b>\n\nВыберите каталог:"),
     "cat_title": ("Категория: каталог (шапка)", "{name}",
                   "<b>{name}</b>\n\n<i><b>ВАЖЛИВО!</b> Найдешевші акаунти не завжди є в наявності. "
                   "Ми намагаємось поповнювати акаунти якнайшвидше.</i>",
@@ -881,10 +857,10 @@ DB_ = {
     "shop": ("Меню: Витрина", "🛒 Витрина", "🛒 Витрина"),
     "profile": ("Меню: Профиль", "👤 Профиль", "👤 Профиль"),
     "balance": ("Меню: Баланс", "💼 Баланс", "💼 Баланс"),
-    "history": ("Меню: История покупок", "📖 Історія покупок", "📖 История покупок"),
+    "history": ("Меню: История покупок", "📁 Історія покупок", "📁 История покупок"),
     "lang": ("Меню: Язык", "🌐 Язык интерфейса", "🌐 Язык интерфейса"),
     "admin": ("Меню: Админ-панель", "🛠 Адмін-панель", "🛠 Админ-панель"),
-    "support": ("Кнопка поддержки", "🆘 Поддержка", "🆘 Поддержка"),
+    "support": ("Кнопка поддержки", "⚠️ Поддержка", "⚠️ Поддержка"),
     "back": ("Кнопка «Назад»", "⬅️ Назад", "⬅️ Назад"),
     "custom_qty": ("Своё количество", "✏️ Своя кількість", "✏️ Своё количество"),
     "pay": ("Купить (подтвердить)", "✅ Купити", "✅ Купить"),
@@ -912,6 +888,52 @@ DB_ = {
 for _k, _v in list(DB_.items()):
     if len(_v) == 3:
         DB_[_k] = (_v[0], _v[2], _v[2])
+
+# Премиум-иконки кнопок из https://t.me/addemoji/TranslucentPack
+DEFAULT_BTN_ICON = {
+    "shop": "5278613311858959074",       # 🛒
+    "profile": "5275979556308674886",    # 👤
+    "balance": "5276037216244624892",    # 💼
+    "history": "5278227821364275264",    # 📁
+    "support": "5276240711795107620",    # ⚠️
+    "admin": "5276314275994954605",      # 🔨
+}
+# Иконка категории MAX из https://t.me/addemoji/MAX_Mess
+MAX_ICON = "5449407131675558756"
+
+# Логотипы сервисов из https://t.me/addemoji/logoskirnel
+SERVICE_ICONS = (
+    (("gmail", "гмейл", "гмаил", "google"), "5303416490295304868"),
+    (("discord", "дискорд"), "5280869505424172134"),
+    (("telegram", "телеграм"), "5285350148451344065"),
+    (("tiktok", "тикток", "tik tok"), "5280662183057825163"),
+    (("vk", "вк", "вконтакте"), "5278229754099540071"),
+    (("max", "макс"), "5456166744479533085"),
+)
+
+# Иконки админ-панели из того же TranslucentPack.
+ADMIN_ICON = {
+    "deps": "5276220667182736079",       # 📥 заявки на пополнение
+    "orders": "5276422526350681413",     # 🎁 заявки на выдачу
+    "cats": "5278540791336165644",       # 📦 товары и склад
+    "tg": "5276111746812112286",         # ⭐ Stars / Premium
+    "design": "5276442772826515132",     # 🎨 оформление
+    "stats": "5278778882848220741",      # 📊 статистика
+    "give": "5276037216244624892",       # 💼 выдать баланс
+    "user": "5276395476646653290",       # 🔍 пользователь
+    "reqs": "5276398496008663230",       # 👝 реквизиты
+    "subs": "5278528159837348960",       # 📢 подписка
+    "staff": "5298668674532538341",      # 👥 персонал
+    "bc": "5278589204207528856",         # 📨 рассылка
+    "pay": "5255933397750014894",        # 💱 платежи / курсы
+    "set": "5278753302023004775",        # ℹ️ настройки
+    "home": "5278413853577734640",       # 🏠 в меню
+    "panel": "5276314275994954605",      # 🔨 заголовок и «назад»
+    "owner": "5276229330131772747",      # 👑
+    "admin": "5276262671962892944",      # 🛡
+    "mod": "5276381204470329471",        # 🧑‍💻
+    "fsms": "5278647306525108244",       # 🖥 поставщик F-SMS
+}
 
 
 async def sync_country_order_ui():
@@ -976,9 +998,36 @@ def txt(L, key):
     return d[2] if L == "ua" else d[3]
 
 
+# Локальные баннеры. Если в админке для экрана уже задано медиа — используется оно.
+DEFAULT_SCREEN_MEDIA = {
+    "welcome": "assets/welcome.jpg",
+    "shop_title": "assets/shop.jpg",
+    "prof_text": "assets/profile.jpg",
+    "bal_text": "assets/balance.jpg",
+    "hist": "assets/history.jpg",
+    "tg_prem": "assets/premium.jpg",
+}
+
+
 def text_media(L, key):
     ov = UI_T.get((key, L))
-    return (ov[1], ov[2]) if ov and ov[1] else (None, None)
+    if ov and ov[1]:
+        return (ov[1], ov[2])
+    rel = DEFAULT_SCREEN_MEDIA.get(key)
+    if rel and (ROOT / rel).is_file():
+        return "photo", rel
+    return None, None
+
+
+def as_media_input(mf):
+    """file_id Telegram или локальный файл из папки проекта."""
+    if isinstance(mf, str) and mf:
+        path = Path(mf)
+        if not path.is_absolute():
+            path = ROOT / path
+        if path.is_file():
+            return FSInputFile(path)
+    return mf
 
 
 def fill(s, **kw):
@@ -1009,8 +1058,11 @@ def B(L, key, data=None, url=None):
     ov = UI_B.get((key, L))
     d = DB_[key]
     label = ov[0] if ov and ov[0] else (d[1] if L == "ua" else d[2])
+    icon = ov[1] if ov and ov[1] else DEFAULT_BTN_ICON.get(key)
+    if icon and not (ov and ov[1]):
+        label = re.sub(r"^[^\wА-Яа-яЁё]+", "", label).strip() or label
     return InlineKeyboardButton(text=label, callback_data=data, url=url,
-                                icon_custom_emoji_id=ov[1] if ov else None, style=ov[2] if ov else None)
+                                icon_custom_emoji_id=icon, style=ov[2] if ov else None)
 
 
 def mk_btn(label, data=None, emoji_id=None, url=None):
@@ -1048,6 +1100,24 @@ def parse_label(m):
     return text.strip(), emoji_id
 
 
+def read_button_emoji(m):
+    """Обычный смайлик или премиум-эмодзи для кнопки каталога."""
+    for e in (m.entities or m.caption_entities or []):
+        if e.type == "custom_emoji" and e.custom_emoji_id:
+            return "premium", e.custom_emoji_id
+    text = (m.text or m.caption or "").strip()
+    if text and len(text) <= 16 and not re.search(r"[A-Za-zА-Яа-яЁё]", text):
+        return "plain", text
+    return None
+
+
+def catalog_label(name, kind, emoji):
+    clean = re.sub(r"^[^\wА-Яа-яЁё]+", "", (name or "")).strip() or (name or "").strip()
+    if kind == "premium":
+        return clean, emoji
+    return f"{emoji} {clean}".strip(), None
+
+
 def extract_media(m):
     if m.animation:
         return "animation", m.animation.file_id
@@ -1077,13 +1147,14 @@ async def try_send(bot, chat_id, text, markup=None, mt=None, mf=None):
     media_fn = {"photo": bot.send_photo, "animation": bot.send_animation, "video": bot.send_video}
     last = None
     if mt in media_fn:
+        source = as_media_input(mf)
         try:
             if len(text) > 1024:  # подпись ограничена — медиа отдельно, текст ниже
-                await media_fn[mt](chat_id, mf)
+                await media_fn[mt](chat_id, source)
             else:
                 for t, mk, pm in variants:
                     try:
-                        return await media_fn[mt](chat_id, mf, caption=t, reply_markup=mk, parse_mode=pm)
+                        return await media_fn[mt](chat_id, source, caption=t, reply_markup=mk, parse_mode=pm)
                     except TelegramBadRequest as e:
                         last = e
         except TelegramBadRequest as e:  # битый file_id — покажем хотя бы текст
@@ -1197,7 +1268,8 @@ async def main_menu(ev, uid):
     L = await lang_of(uid)
     rows = [[B(L, "shop", "m:shop")],
             [B(L, "profile", "m:prof"), B(L, "balance", "m:bal")],
-            [B(L, "history", "m:hist")]]
+            [B(L, "history", "m:hist")],
+            [mk_btn("Возвраты", "m:refs", "5276412364458059956")]]
     if support_row(L):
         rows.append(support_row(L))
     if await role_of(uid):
@@ -1225,6 +1297,25 @@ async def missing_channels(bot: Bot, uid):
     return miss
 
 
+async def touch_user(user):
+    """Один заход в базу на каждое нажатие: создать, обновить имя, взять язык и роль."""
+    async with conn() as c:
+        c.row_factory = aiosqlite.Row
+        await c.execute(
+            "INSERT OR IGNORE INTO users(id,username,created) VALUES(?,?,?)",
+            (user.id, user.username, now()),
+        )
+        await c.execute("UPDATE users SET username=? WHERE id=?", (user.username, user.id))
+        row = await (await c.execute(
+            """SELECT u.lang, u.banned, r.role
+               FROM users u LEFT JOIN roles r ON r.user_id=u.id
+               WHERE u.id=?""",
+            (user.id,),
+        )).fetchone()
+        await c.commit()
+        return row
+
+
 async def reset_state(state, uid):
     """Сбросить FSM; если админ бросил выдачу — освободить заявку."""
     if await state.get_state() == Fulfill.msg.state:
@@ -1243,9 +1334,7 @@ class Gate(BaseMiddleware):
         user = event.from_user
         if not user or user.is_bot:
             return True
-        await q("INSERT OR IGNORE INTO users(id,username,created) VALUES(?,?,?)", (user.id, user.username, now()))
-        await q("UPDATE users SET username=? WHERE id=?", (user.username, user.id))
-        row = await q("SELECT lang, banned FROM users WHERE id=?", (user.id,), "one")
+        row = await touch_user(user)
         lang = row["lang"]
         cd = (event.data or "") if isinstance(event, CallbackQuery) else ""
         if not lang:
@@ -1253,7 +1342,7 @@ class Gate(BaseMiddleware):
                 return True
             await screen(event, "choose_lang", "ru", lang_kb())
             return False
-        role = await role_of(user.id)
+        role = "owner" if user.id in OWNERS else row["role"]
         if role in ("owner", "admin"):
             return True
         if SET.get("legacy_uah_pending") == "1":
@@ -1647,10 +1736,11 @@ async def a_tg_done(c: CallbackQuery, bot: Bot):
 @r.callback_query(F.data == "m:shop")
 async def shop(c: CallbackQuery):
     L = await lang_of(c.from_user.id)
-    rows = await tg_rows(L)
-    rows += [[mk_btn(x["name"], f"s:cat:{x['id']}", x["emoji_id"])] for x in await q("SELECT * FROM categories", fetch="all")]
+    cats = await q("SELECT * FROM categories ORDER BY id", fetch="all")
+    rows = [[mk_btn(x["name"], f"s:cat:{x['id']}", x["emoji_id"])] for x in cats]
     rows.append([B(L, "back", "m:home")])
-    await screen(c, "shop_title", L, kb(rows))
+    override = None if cats else "🛒 <b>Витрина товаров</b>\n\nКаталогов пока нет."
+    await screen(c, "shop_title", L, kb(rows), override=override)
 
 
 async def acc_kind(pid):
@@ -1727,7 +1817,8 @@ async def render_cat(ev, uid, cid, sort="o", dr="a", page=0):
         base = f"s:cat:{cid}:{sort}:{dr}:"
         rows.append([btn("«", base + "0"), btn("‹", base + str(max(page - 1, 0))), btn(f"{page + 1}/{pages}", "noop"),
                      btn("›", base + str(min(page + 1, pages - 1))), btn("»", base + str(pages - 1))])
-    rows.append([B(L, "back", "m:shop")])
+    back_to = f"z:pick:{cid}" if await fsms_flow.has_supplier(cid) else "m:shop"
+    rows.append([B(L, "back", back_to)])
     await screen(ev, "cat_title" if (prods or query) else "empty", L, kb(rows),
                  media=(cat["mtype"], cat["mfile"]), name=html.escape(cat["name"]))
 
@@ -1736,11 +1827,15 @@ async def render_cat(ev, uid, cid, sort="o", dr="a", page=0):
 async def shop_cat(c: CallbackQuery, state: FSMContext):
     p = c.data.split(":")
     cid = int(p[2])
-    if len(p) == 3:
-        SEARCH.pop((c.from_user.id, cid), None)
-        await state.clear()
-    await render_cat(c, c.from_user.id, cid, p[3] if len(p) > 3 else "o", p[4] if len(p) > 4 else "a",
-                     int(p[5]) if len(p) > 5 else 0)
+    SEARCH.pop((c.from_user.id, cid), None)
+    await state.clear()
+    cat = await q("SELECT * FROM categories WHERE id=?", (cid,), "one")
+    if not cat:
+        return await c.answer("Каталог не найден", show_alert=True)
+    if await fsms_flow.has_supplier(cid):
+        return await fsms_flow.open_services(c, cid)
+    L = await lang_of(c.from_user.id)
+    await screen(c, "empty", L, kb([[B(L, "back", "m:shop")]]), name=html.escape(cat["name"]))
 
 
 @r.callback_query(F.data.startswith("s:srch:"))
@@ -1749,7 +1844,7 @@ async def s_srch(c: CallbackQuery, state: FSMContext):
     cid = int(c.data.split(":")[2])
     await state.set_state(Srch.q)
     await state.update_data(cid=cid)
-    await screen(c, "search_prompt", L, kb([[B(L, "cancel", f"s:cat:{cid}")]]))
+    await screen(c, "search_prompt", L, kb([[B(L, "cancel", f"z:wh:{cid}")]]))
 
 
 @r.message(Srch.q)
@@ -2007,7 +2102,9 @@ async def hist_item(c: CallbackQuery):
 async def profile(c: CallbackQuery):
     L = await lang_of(c.from_user.id)
     u = await q("SELECT balance FROM users WHERE id=?", (c.from_user.id,), "one")
-    n = (await q("SELECT COUNT(*) AS n FROM orders WHERE user_id=?", (c.from_user.id,), "one"))["n"]
+    n_shop = (await q("SELECT COUNT(*) AS n FROM orders WHERE user_id=?", (c.from_user.id,), "one"))["n"]
+    n_fsms = (await q("SELECT COUNT(*) AS n FROM fsms_orders WHERE user_id=?", (c.from_user.id,), "one"))["n"]
+    n = int(n_shop or 0) + int(n_fsms or 0)
     await screen(c, "prof_text", L, kb([[B(L, "back", "m:home")]]), id=c.from_user.id, bal=money(u["balance"]), orders=n)
 
 
@@ -2046,11 +2143,27 @@ async def dep_hist(c: CallbackQuery):
 async def hist(c: CallbackQuery):
     L = await lang_of(c.from_user.id)
     os_ = await q("SELECT * FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 20", (c.from_user.id,), "all")
+    fs_ = await q(
+        "SELECT * FROM fsms_orders WHERE user_id=? ORDER BY id DESC LIMIT 20",
+        (c.from_user.id,), "all",
+    )
     ic = {"active": "⏳", "done": "✅", "refunded": "↩️"}
-    rows = [[btn(f"{ic.get(o['status'], '')} #{o['id']} {o['title']} × {o['qty']} — {money(o['total'])}",
-                 f"h:{o['id']}")] for o in os_]
+    fs_ic = {"issued": "⏳", "waiting": "💫", "coded": "✅", "done": "✅", "missed": "❌", "cancelled": "❌", "refunded": "↩️"}
+    items = [(o["created"] or "", "shop", o) for o in os_]
+    items += [(o["created"] or "", "fsms", o) for o in fs_]
+    items.sort(key=lambda item: item[0], reverse=True)
+    rows = []
+    for _, kind, o in items[:20]:
+        if kind == "shop":
+            rows.append([btn(
+                f"{ic.get(o['status'], '')} #{o['id']} {o['title']} × {o['qty']} — {money(o['total'])}",
+                f"h:{o['id']}",
+            )])
+        else:
+            label = f"{fs_ic.get(o['status'], '•')} {o['service_name']} · {o['phone']} — {money(o['price'])}"
+            rows.append([btn(label if len(label) <= 60 else label[:59] + "…", f"z:hist:{o['id']}")])
     rows.append([B(L, "back", "m:home")])
-    await screen(c, "hist", L, kb(rows), list="" if os_ else plain(txt(L, "no_hist")))
+    await screen(c, "hist", L, kb(rows), list="" if items else plain(txt(L, "no_hist")))
 
 
 # ───────────────────────── Поповнення ─────────────────────────
@@ -2588,22 +2701,33 @@ async def tp_receipt(m: Message, state: FSMContext, bot: Bot):
 
 
 # ───────────────────────── Адмін-панель ─────────────────────────
+def admin_back_btn():
+    return mk_btn("Админ-панель", "a:home", ADMIN_ICON["panel"])
+
+
 async def admin_home(ev):
     role = await role_of(ev.from_user.id)
-    rows = [[btn("🧾 Заявки на пополнение", "a:deps"), btn("📥 Заявки на выдачу", "a:orders")],
-            [btn("📦 Товары и склад", "a:cats")]]
+    A = ADMIN_ICON
+    rows = [[mk_btn("Заявки на пополнение", "a:deps", A["deps"]),
+             mk_btn("Заявки на выдачу", "a:orders", A["orders"])],
+            [mk_btn("Каталоги", "a:cats", A["cats"])]]
     if role in ("owner", "admin"):
-        rows += [[btn("⭐ Telegram Stars / 💎 Premium", "f:tg")],
-             [btn("🎨 Оформление (тексты/кнопки/медиа)", "f:ds")],
-                 [btn("📊 Статистика", "f:stats"), btn("💰 Выдать баланс", "f:give")],
-                 [btn("🔎 Пользователь / бан", "f:usr")],
-                 [btn("💳 Реквизиты", "f:reqs"), btn("📢 Обяз. подписка", "f:subs")],
-                 [btn("👥 Персонал", "f:staff"), btn("📨 Рассылка", "f:bc")],
-                 [btn("💳 Платежи / курсы", "f:payments")],
-                 [btn("⚙️ Настройки / поддержка", "f:set")]]
-    rows.append([btn("⬅️ В меню", "m:home")])
-    title = {"owner": "👑 Владелец", "admin": "🛡 Главный админ", "mod": "🧰 Модератор"}[role]
-    await show(ev, f"🛠 <b>Админ-панель {SHOP}</b>\nРоль: {title}", kb(rows))
+        rows += [[mk_btn("Поставщик F-SMS", "a:fsms", A["fsms"])],
+                 [mk_btn("Telegram Stars / Premium", "f:tg", A["tg"])],
+                 [mk_btn("Оформление", "f:ds", A["design"])],
+                 [mk_btn("Статистика", "f:stats", A["stats"]), mk_btn("Выдать баланс", "f:give", A["give"])],
+                 [mk_btn("Пользователь / бан", "f:usr", A["user"])],
+                 [mk_btn("Реквизиты", "f:reqs", A["reqs"]), mk_btn("Обяз. подписка", "f:subs", A["subs"])],
+                 [mk_btn("Персонал", "f:staff", A["staff"]), mk_btn("Рассылка", "f:bc", A["bc"])],
+                 [mk_btn("Платежи / курсы", "f:payments", A["pay"])],
+                 [mk_btn("Настройки / поддержка", "f:set", A["set"])]]
+    rows.append([mk_btn("В меню", "m:home", A["home"])])
+    role_name = {"owner": "Владелец", "admin": "Главный админ", "mod": "Модератор"}[role]
+    role_fallback = {"owner": "👑", "admin": "🛡", "mod": "🧑‍💻"}[role]
+    title = f'<tg-emoji emoji-id="{A[role]}">{role_fallback}</tg-emoji> {role_name}'
+    text = (f'<tg-emoji emoji-id="{A["panel"]}">🔨</tg-emoji> <b>Админ-панель {html.escape(SHOP)}</b>\n'
+            f"Роль: {title}")
+    await show(ev, text, kb(rows))
 
 
 @r.callback_query(F.data == "a:home", Staff())
@@ -2613,7 +2737,7 @@ async def a_home(c: CallbackQuery, state: FSMContext):
 
 
 def back_admin():
-    return kb([[btn("⬅️ Админ-панель", "a:home")]])
+    return kb([[admin_back_btn()]])
 
 
 # ---- Заявки на пополнение
@@ -2623,7 +2747,7 @@ async def a_deps(c: CallbackQuery):
     if not ds:
         return await show(c, "Нет ожидающих заявок.", back_admin())
     rows = [[btn(f"№{d['id']} — {money(d['amount'])} USD ({float(d['paid_amount'] or 0):.2f} {d['currency'] or 'UAH'}) — user {d['user_id']}", f"a:dv:{d['id']}")] for d in ds]
-    rows.append([btn("⬅️ Админ-панель", "a:home")])
+    rows.append([admin_back_btn()])
     await show(c, "🧾 <b>Ожидают подтверждения:</b>", kb(rows))
 
 
@@ -2685,7 +2809,7 @@ async def a_orders(c: CallbackQuery):
     if not os_:
         return await show(c, "Нет заявок на выдачу.", back_admin())
     rows = [[btn(f"#{o['id']} {o['title']} × {o['qty']} — user {o['user_id']}", f"a:ov:{o['id']}")] for o in os_]
-    rows.append([btn("⬅️ Админ-панель", "a:home")])
+    rows.append([admin_back_btn()])
     await show(c, "📥 <b>Ожидают выдачи:</b>", kb(rows))
 
 
@@ -2796,6 +2920,7 @@ class AddStock(StatesGroup):
 
 class NewCat(StatesGroup):
     name = State()
+    emoji = State()
 
 
 class NewProd(StatesGroup):
@@ -2806,37 +2931,27 @@ class NewProd(StatesGroup):
 @r.callback_query(F.data == "a:cats", Staff())
 async def a_cats(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    rows = [[mk_btn(x["name"], f"a:cat:{x['id']}", x["emoji_id"])] for x in await q("SELECT * FROM categories", fetch="all")]
+    rows = [[mk_btn(x["name"], f"a:cat:{x['id']}", x["emoji_id"])] for x in await q("SELECT * FROM categories ORDER BY id", fetch="all")]
     if await role_of(c.from_user.id) in ("owner", "admin"):
-        rows.append([btn("➕ Категория", "f:addcat")])
-    rows.append([btn("⬅️ Админ-панель", "a:home")])
-    await show(c, "📦 <b>Категории:</b>", kb(rows))
+        rows.append([btn("➕ Каталог", "f:addcat")])
+    rows.append([admin_back_btn()])
+    await show(c, "📦 <b>Каталоги</b>\n\nПокупатель видит только то, что добавлено здесь.", kb(rows))
 
 
 @r.callback_query(F.data.startswith("a:cat:"), Staff())
 async def a_cat(c: CallbackQuery):
-    parts = c.data.split(":")
-    cid = int(parts[2])
-    page = int(parts[3]) if len(parts) > 3 else 0
+    cid = int(c.data.split(":")[2])
+    cat = await q("SELECT * FROM categories WHERE id=?", (cid,), "one")
+    if not cat:
+        return await show(c, "Каталог не найден.", kb([[btn("⬅️ Назад", "a:cats")]]))
     full = await role_of(c.from_user.id) in ("owner", "admin")
-    prods = await q("""SELECT p.*, (SELECT COUNT(*) FROM stock s WHERE s.product_id=p.id AND s.sold=0) AS n
-                       FROM products p WHERE p.cat_id=? AND p.active=1 ORDER BY p.id""", (cid,), "all")
-    per = 30
-    rows = [[mk_btn(f"{x['title']} | {money(x['price'])} | " + ("🔁 ручн." if is_manual(x) else f"{x['n']} шт."),
-                    f"a:p:{x['id']}", x["emoji_id"])] for x in prods[page * per:(page + 1) * per]]
-    nav = []
-    if page > 0:
-        nav.append(btn("◀️", f"a:cat:{cid}:{page - 1}"))
-    if (page + 1) * per < len(prods):
-        nav.append(btn("▶️", f"a:cat:{cid}:{page + 1}"))
-    if nav:
-        rows.append(nav)
+    rows = []
     if full:
-        rows += [[btn("➕ Товар", f"f:addprod:{cid}")],
-                 [btn("✏️ Название", f"f:cn:{cid}"), btn("🖼 Медиа", f"f:cm:{cid}"), btn("🗑 Медиа", f"f:cmd:{cid}")],
-                 [btn("🗑 Удалить категорию", f"f:cdel:{cid}")]]
+        rows += [[btn("✏️ Название", f"f:cn:{cid}"), btn("😀 Смайлик", f"f:ce:{cid}")],
+                 [btn("🗑 Удалить каталог", f"f:cdel:{cid}")]]
     rows.append([btn("⬅️ Назад", "a:cats")])
-    await show(c, f"Товары категории (всего {len(prods)}):", kb(rows))
+    mark = "премиум" if cat["emoji_id"] else "обычный"
+    await show(c, f"<b>{html.escape(cat['name'])}</b>\nСмайлик кнопки: {mark}", kb(rows))
 
 
 @r.callback_query(F.data.startswith("a:p:"), Staff())
@@ -3131,7 +3246,10 @@ async def edit_input(m: Message, state: FSMContext):
         if not label:
             return await m.answer("Нужен текст названия.")
         tbl, col = ("categories", "name") if kind == "cat_name" else ("products", "title")
-        await q(f"UPDATE {tbl} SET {col}=?, emoji_id=? WHERE id=?", (label, eid, d["id"]))
+        if kind == "cat_name" and not eid:
+            await q(f"UPDATE {tbl} SET {col}=? WHERE id=?", (label, d["id"]))
+        else:
+            await q(f"UPDATE {tbl} SET {col}=?, emoji_id=? WHERE id=?", (label, eid, d["id"]))
     elif kind in ("cat_media", "prod_media"):
         med = extract_media(m)
         if not med:
@@ -3255,23 +3373,60 @@ async def edit_input(m: Message, state: FSMContext):
 @r.callback_query(F.data == "f:addcat", Full())
 async def f_addcat(c: CallbackQuery, state: FSMContext):
     await state.set_state(NewCat.name)
-    await show(c, "Название новой категории (эмодзи и премиум-эмодзи в начале — ок):" + BTN_HINT)
+    await state.update_data(cid=None)
+    await show(c, "Название нового каталога.\nНапример: Мессенджеры, Почты.",
+               kb([[btn("✖️ Отмена", "a:cats")]]))
 
 
 @r.message(NewCat.name, Full())
 async def f_addcat_in(m: Message, state: FSMContext):
     label, eid = parse_label(m)
     if not label:
-        return await m.answer("Нужен текст.")
+        return await m.answer("Нужен текст названия.")
+    if eid:
+        label = re.sub(r"^[^\wА-Яа-яЁё]+", "", label).strip() or label
+    await state.update_data(name=label, emoji_id=eid)
+    await state.set_state(NewCat.emoji)
+    await m.answer(
+        "Отправьте смайлик для кнопки каталога.\n"
+        "Подойдёт обычный эмодзи или премиум-эмодзи.",
+        reply_markup=kb([[btn("✖️ Отмена", "a:cats")]]),
+    )
+
+
+@r.message(NewCat.emoji, Full())
+async def f_addcat_emoji(m: Message, state: FSMContext):
+    picked = read_button_emoji(m)
+    if not picked:
+        return await m.answer("Пришлите один смайлик: обычный или премиум.")
+    kind, emoji = picked
+    data = await state.get_data()
     await state.clear()
-    await q("INSERT INTO categories(name,emoji_id) VALUES(?,?)", (label, eid))
-    await m.answer("✅ Категория добавлена.", reply_markup=kb([[btn("📦 Категории", "a:cats")]]))
+    name, emoji_id = catalog_label(data.get("name"), kind, emoji)
+    cid = data.get("cid")
+    if cid:
+        await q("UPDATE categories SET name=?, emoji_id=? WHERE id=?", (name, emoji_id, int(cid)))
+        return await m.answer("✅ Смайлик сохранён.", reply_markup=kb([[btn("📦 Каталоги", f"a:cat:{cid}")]]))
+    await q("INSERT INTO categories(name,emoji_id) VALUES(?,?)", (name, emoji_id))
+    await m.answer("✅ Каталог добавлен.", reply_markup=kb([[btn("📦 Каталоги", "a:cats")]]))
+
+
+@r.callback_query(F.data.startswith("f:ce:"), Full())
+async def f_ce(c: CallbackQuery, state: FSMContext):
+    cid = int(c.data.split(":")[2])
+    cat = await q("SELECT name FROM categories WHERE id=?", (cid,), "one")
+    if not cat:
+        return await c.answer("Каталог не найден", show_alert=True)
+    await state.set_state(NewCat.emoji)
+    await state.update_data(cid=cid, name=cat["name"], emoji_id=None)
+    await show(c, f"Новый смайлик для «{html.escape(cat['name'])}».\nОбычный или премиум.",
+               kb([[btn("✖️ Отмена", f"a:cat:{cid}")]]))
 
 
 @r.callback_query(F.data.startswith("f:cn:"), Full())
 async def f_cn(c, state):
     cid = c.data.split(":")[2]
-    await start_edit(c, state, "cat_name", "Новое название категории:" + BTN_HINT, f"a:cat:{cid}", id=int(cid))
+    await start_edit(c, state, "cat_name", "Новое название каталога:", f"a:cat:{cid}", id=int(cid))
 
 
 @r.callback_query(F.data.startswith("f:cm:"), Full())
@@ -3291,7 +3446,7 @@ async def f_cmd(c: CallbackQuery):
 async def f_cdel_ask(c: CallbackQuery):
     cid = int(c.data.split(":")[2])
     cat = await q("SELECT name FROM categories WHERE id=?", (cid,), "one")
-    await show(c, f"🗑 Удалить категорию «{html.escape(cat['name']) if cat else cid}» вместе со всеми её товарами?",
+    await show(c, f"🗑 Удалить каталог «{html.escape(cat['name']) if cat else cid}»?",
                kb([[btn("✅ Да, удалить", f"f:cdely:{cid}"), btn("✖️ Нет", f"a:cat:{cid}")]]))
 
 
@@ -3299,8 +3454,9 @@ async def f_cdel_ask(c: CallbackQuery):
 async def f_cdel(c: CallbackQuery):
     cid = int(c.data.split(":")[2])
     await q("UPDATE products SET active=0 WHERE cat_id=?", (cid,))
+    await q("DELETE FROM fsms_services WHERE cat_id=?", (cid,))
     await q("DELETE FROM categories WHERE id=?", (cid,))
-    await show(c, "🗑 Категория удалена.", kb([[btn("📦 Категории", "a:cats")]]))
+    await show(c, "🗑 Каталог удалён.", kb([[btn("📦 Каталоги", "a:cats")]]))
 
 
 @r.callback_query(F.data.startswith("f:addprod:"), Full())
@@ -3511,7 +3667,7 @@ async def f_ds(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await show(c, "🎨 <b>Оформление бота</b>\n\nНастройка русских текстов, кнопок и медиа:",
                kb([[btn("🇷🇺 Русский", "f:dl:ru")],
-                   [btn("⬅️ Админ-панель", "a:home")]]))
+                   [admin_back_btn()]]))
 
 
 @r.callback_query(F.data.startswith("f:dl:"), Full())
@@ -3806,7 +3962,7 @@ async def f_set(c: CallbackQuery, state: FSMContext):
     u = SET.get("support") or SUPPORT_ENV
     await show(c, f"⚙️ <b>Настройки</b>\n\n🆘 Поддержка: {'@' + u if u else 'не задана'}\n"
                   "При нажатии на «Поддержка» покупателя перебросит в этот аккаунт.",
-               kb([[btn("✏️ Изменить @username поддержки", "f:sup")], [btn("💳 Платежи / курсы", "f:payments")], [btn("⬅️ Админ-панель", "a:home")]]))
+               kb([[btn("✏️ Изменить @username поддержки", "f:sup")], [btn("💳 Платежи / курсы", "f:payments")], [admin_back_btn()]]))
 
 
 @r.callback_query(F.data == "f:sup", Full())
@@ -3890,7 +4046,7 @@ async def user_card(uid):
             f"🛒 Заказов: {o['n']} на {money(o['s'])}\n💳 Пополнено: {money(d['s'])}\n"
             f"Статус: {'🚫 заблокирован' if u['banned'] else '✅ активен'}")
     mk = kb([[btn("✅ Разблокировать" if u["banned"] else "🚫 Заблокировать", f"f:ub:{uid}:{0 if u['banned'] else 1}")],
-             [btn("💰 Изменить баланс", f"f:ug:{uid}")], [btn("⬅️ Админ-панель", "a:home")]])
+             [btn("💰 Изменить баланс", f"f:ug:{uid}")], [admin_back_btn()]])
     return text, mk
 
 
@@ -3940,7 +4096,7 @@ class NewReq(StatesGroup):
 async def f_reqs(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rows = [[btn(f"🗑 {x['bank']} • {x['card']}", f"f:rd:{x['id']}")] for x in await q("SELECT * FROM requisites", fetch="all")]
-    rows += [[btn("➕ Добавить реквизиты", "f:ra")], [btn("⬅️ Админ-панель", "a:home")]]
+    rows += [[btn("➕ Добавить реквизиты", "f:ra")], [admin_back_btn()]]
     await show(c, "💳 <b>Реквизиты для пополнения</b>\n(нажмите, чтобы удалить)", kb(rows))
 
 
@@ -3991,7 +4147,7 @@ class NewSub(StatesGroup):
 async def f_subs(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rows = [[btn(f"🗑 {x['title']}", f"f:sd:{x['id']}")] for x in await q("SELECT * FROM channels", fetch="all")]
-    rows += [[btn("➕ Добавить канал", "f:sa")], [btn("⬅️ Админ-панель", "a:home")]]
+    rows += [[btn("➕ Добавить канал", "f:sa")], [admin_back_btn()]]
     await show(c, "📢 <b>Обязательная подписка</b>\n(нажмите на канал, чтобы убрать)\n\n"
                   "Бот должен быть админом в канале.", kb(rows))
 
@@ -4041,7 +4197,7 @@ async def f_staff(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rows = [[btn(f"🗑 {'🛡 админ' if x['role'] == 'admin' else '🧰 модер'} • {x['user_id']}", f"f:xd:{x['user_id']}")]
             for x in await q("SELECT * FROM roles", fetch="all")]
-    rows += [[btn("➕ Главный админ", "f:xa:admin"), btn("➕ Модератор", "f:xa:mod")], [btn("⬅️ Админ-панель", "a:home")]]
+    rows += [[btn("➕ Главный админ", "f:xa:admin"), btn("➕ Модератор", "f:xa:mod")], [admin_back_btn()]]
     owners = ", ".join(f"<code>{o}</code>" for o in OWNERS)
     await show(c, f"👥 <b>Персонал</b>\n👑 Владельцы: {owners}\n\n"
                   "🛡 Главный админ — полная панель как у владельца (добавляет и снимает только владелец).\n"
@@ -4156,7 +4312,7 @@ async def f_tg(c: CallbackQuery, state: FSMContext):
     rows += [[btn("➕ План Premium", "f:tpa")],
              [btn("📝 Тексты и картинки 🇷🇺", "f:tgt:ru:0")],
              [btn("🔘 Названия кнопок 🇷🇺", "f:db:ru:0")],
-             [btn("⬅️ Админ-панель", "a:home")]]
+             [admin_back_btn()]]
     await show(c, text, kb(rows))
 
 
@@ -4267,6 +4423,50 @@ async def fallback(m: Message):
     await main_menu(m, m.from_user.id)
 
 
+async def sync_bundled_media():
+    """Картинки категорий из assets/. Уже заданное в админке медиа не трогаем."""
+    rows = await q("SELECT id, name FROM categories", fetch="all")
+    names = [(r["id"], (r["name"] or "").casefold()) for r in rows]
+    if not any("max" in name or "макс" in name for _, name in names):
+        await q("INSERT INTO categories(name,emoji_id) VALUES(?,?)", ("MAX", MAX_ICON))
+        rows = await q("SELECT id, name FROM categories", fetch="all")
+    rules = (
+        (("max", "макс"), "assets/max.jpg"),
+        (("vk", "вк", "вконтакте"), "assets/vk.jpg"),
+        (("telegram", "телеграм"), "assets/telegram.jpg"),
+    )
+    for row in rows:
+        name = (row["name"] or "").casefold()
+        if "max" in name or "макс" in name:
+            await q(
+                "UPDATE categories SET emoji_id=? WHERE id=? AND (emoji_id IS NULL OR emoji_id='')",
+                (MAX_ICON, row["id"]),
+            )
+            if (row["name"] or "").strip() in ("💬 MAX", "💬 max"):
+                await q("UPDATE categories SET name='MAX' WHERE id=?", (row["id"],))
+        for keys, rel in rules:
+            if any(key in name for key in keys) and (ROOT / rel).is_file():
+                await q(
+                    "UPDATE categories SET mtype='photo', mfile=? "
+                    "WHERE id=? AND (mtype IS NULL OR mtype='')",
+                    (rel, row["id"]),
+                )
+                break
+
+
+async def sync_service_icons():
+    """Ставит логотипы сервисов на кнопки категорий и убирает дублирующий эмодзи из названия."""
+    rows = await q("SELECT id, name FROM categories", fetch="all")
+    for row in rows:
+        raw = row["name"] or ""
+        key = raw.casefold()
+        for keys, emoji_id in SERVICE_ICONS:
+            if any(part in key for part in keys):
+                clean = re.sub(r"^[^\wА-Яа-яЁё]+", "", raw).strip() or raw
+                await q("UPDATE categories SET emoji_id=?, name=? WHERE id=?", (emoji_id, clean, row["id"]))
+                break
+
+
 # ───────────────────────── Запуск ─────────────────────────
 async def main():
     logging.basicConfig(level=logging.INFO)
@@ -4294,6 +4494,7 @@ async def main():
     dp.include_router(r)
     await bot.delete_webhook(drop_pending_updates=True)
     payment_task = asyncio.create_task(payment_watchdog(bot))
+    await fsms_flow.resume(bot)
     try:
         await dp.start_polling(bot)
     finally:
@@ -4302,6 +4503,11 @@ async def main():
             await payment_task
         except asyncio.CancelledError:
             pass
+        await fsms_flow.shutdown()
+
+
+import fsms_flow  # регистрация обработчиков поставщика; main() уже определён выше
+fsms_flow.register(globals())
 
 
 if __name__ == "__main__":
