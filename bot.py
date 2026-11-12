@@ -4418,6 +4418,27 @@ async def cmd_admin(m: Message, state: FSMContext):
     await admin_home(m)
 
 
+@r.message(Command("backup"), F.from_user.id.in_(OWNERS))
+async def cmd_backup(m: Message):
+    """Только для владельцев: присылает консистентную копию SQLite-базы файлом."""
+    tmp = Path(DB).with_name(f"backup_{int(time.time())}.db")
+    try:
+        async with conn() as src:
+            async with aiosqlite.connect(str(tmp)) as dst:
+                await src.backup(dst)
+        data = tmp.read_bytes()
+        name = f"vh_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
+        await m.answer_document(BufferedInputFile(data, name), caption=f"💾 Бэкап базы, {len(data) // 1024} КБ")
+    except Exception as e:
+        logging.exception("backup failed")
+        await m.answer(f"Не удалось сделать бэкап: {e}")
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 @r.message(StateFilter(None))
 async def fallback(m: Message):
     await main_menu(m, m.from_user.id)
